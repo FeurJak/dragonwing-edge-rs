@@ -648,4 +648,446 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn conv2d_f32_1x1_identity() {
+        // 1x1 conv with identity kernel (c_in == c_out, each channel passes through)
+        let n = 1;
+        let h = 4;
+        let w = 4;
+        let c_in = 2;
+        let c_out = 2;
+
+        // Input: simple values
+        let input: Vec<f32> = (0..(n * h * w * c_in))
+            .map(|i| i as f32 * 0.1)
+            .collect();
+
+        // Identity 1x1 kernel: [1,1,c_in,c_out] where kernel[0,0,i,i]=1, else 0
+        let mut kernel = vec![0.0f32; 1 * 1 * c_in * c_out];
+        for i in 0..c_in.min(c_out) {
+            kernel[i * c_out + i] = 1.0;
+        }
+
+        let mut output = vec![0.0f32; n * h * w * c_out];
+        super::conv2d_f32_nhwc(&mut output, &input, &kernel, n, h, w, c_in, c_out, 1, 1, 1, 1, 0, 0);
+
+        // With identity kernel, output should equal input
+        for (i, (&out, &inp)) in output.iter().zip(input.iter()).enumerate() {
+            let diff = (out - inp).abs();
+            assert!(diff < 1e-5, "conv2d 1x1 identity mismatch at {i}: {out} vs {inp}");
+        }
+    }
+
+    #[test]
+    fn conv2d_f32_3x3_simple() {
+        // 3x3 conv on a small input
+        let n = 1;
+        let h_in = 5;
+        let w_in = 5;
+        let c_in = 1;
+        let c_out = 1;
+        let k = 3;
+        let stride = 1;
+        let pad = 0;
+
+        // All ones input
+        let input = vec![1.0f32; n * h_in * w_in * c_in];
+        // All ones kernel
+        let kernel = vec![1.0f32; k * k * c_in * c_out];
+
+        let h_out = (h_in + 2 * pad - k) / stride + 1; // = 3
+        let w_out = (w_in + 2 * pad - k) / stride + 1; // = 3
+        let mut output = vec![0.0f32; n * h_out * w_out * c_out];
+
+        super::conv2d_f32_nhwc(&mut output, &input, &kernel, n, h_in, w_in, c_in, c_out, k, k, stride, stride, pad, pad);
+
+        // Each output element should be 3*3 = 9 (sum of all ones in 3x3 window)
+        for (i, &out) in output.iter().enumerate() {
+            assert!(
+                (out - 9.0).abs() < 1e-5,
+                "conv2d 3x3 simple mismatch at {i}: expected 9.0, got {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn maxpool2d_basic() {
+        // 2x2 max pooling on a 4x4 input
+        let n = 1;
+        let h_in = 4;
+        let w_in = 4;
+        let c = 1;
+        let pool = 2;
+        let stride = 2;
+
+        // Input with increasing values
+        let input: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let h_out = (h_in - pool) / stride + 1;
+        let w_out = (w_in - pool) / stride + 1;
+        let mut output = vec![0.0f32; n * h_out * w_out * c];
+
+        super::maxpool2d_f32_nhwc(&mut output, &input, n, h_in, w_in, c, pool, pool, stride, stride);
+
+        // Expected: max of each 2x2 block
+        // [0,1,2,3; 4,5,6,7; 8,9,10,11; 12,13,14,15] -> [5, 7, 13, 15]
+        let expected = [5.0, 7.0, 13.0, 15.0];
+        for (i, (&out, &exp)) in output.iter().zip(expected.iter()).enumerate() {
+            assert!((out - exp).abs() < 1e-5, "maxpool2d mismatch at {i}: {out} vs {exp}");
+        }
+    }
+
+    #[test]
+    fn avgpool2d_basic() {
+        // 2x2 avg pooling on a 4x4 input
+        let n = 1;
+        let h_in = 4;
+        let w_in = 4;
+        let c = 1;
+        let pool = 2;
+        let stride = 2;
+
+        // All ones input
+        let input = vec![1.0f32; n * h_in * w_in * c];
+        let h_out = (h_in - pool) / stride + 1;
+        let w_out = (w_in - pool) / stride + 1;
+        let mut output = vec![0.0f32; n * h_out * w_out * c];
+
+        super::avgpool2d_f32_nhwc(&mut output, &input, n, h_in, w_in, c, pool, pool, stride, stride);
+
+        // Average of ones should be 1.0
+        for (i, &out) in output.iter().enumerate() {
+            assert!((out - 1.0).abs() < 1e-5, "avgpool2d mismatch at {i}: {out}");
+        }
+    }
+
+    #[test]
+    fn softmax_basic() {
+        // Simple softmax test
+        let input = [1.0f32, 2.0, 3.0];
+        let mut output = [0.0f32; 3];
+
+        super::softmax_f32(&mut output, &input, 3);
+
+        // Verify: sum to 1, all positive, order preserved
+        let sum: f32 = output.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "softmax sum should be 1.0, got {sum}");
+        assert!(output[0] < output[1] && output[1] < output[2], "softmax should preserve order");
+        assert!(output.iter().all(|&x| x > 0.0), "softmax outputs should be positive");
+    }
+}
+
+// ===========================================================================
+// Convolution operations
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// conv2d_f32_nhwc: Direct convolution for NHWC layout
+// ---------------------------------------------------------------------------
+
+/// 2D convolution in NHWC format.
+///
+/// * `input`: `[N, H, W, C_in]` row-major
+/// * `kernel`: `[K_h, K_w, C_in, C_out]` row-major
+/// * `output`: `[N, H_out, W_out, C_out]` row-major
+///
+/// Parameters:
+/// * `n`: batch size
+/// * `h_in, w_in`: input spatial dimensions
+/// * `c_in`: input channels
+/// * `c_out`: output channels
+/// * `k_h, k_w`: kernel height and width
+/// * `stride_h, stride_w`: stride
+/// * `pad_h, pad_w`: zero-padding (symmetric)
+///
+/// Output dimensions are computed as:
+/// * `h_out = (h_in + 2*pad_h - k_h) / stride_h + 1`
+/// * `w_out = (w_in + 2*pad_w - k_w) / stride_w + 1`
+///
+/// # Panics
+///
+/// Panics if buffer sizes don't match expected dimensions.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_f32_nhwc(
+    output: &mut [f32],
+    input: &[f32],
+    kernel: &[f32],
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    c_out: usize,
+    k_h: usize,
+    k_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) {
+    // Compute output dimensions
+    let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+    let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+
+    // Verify buffer sizes
+    assert_eq!(
+        input.len(),
+        n * h_in * w_in * c_in,
+        "conv2d_f32_nhwc: input size mismatch"
+    );
+    assert_eq!(
+        kernel.len(),
+        k_h * k_w * c_in * c_out,
+        "conv2d_f32_nhwc: kernel size mismatch"
+    );
+    assert_eq!(
+        output.len(),
+        n * h_out * w_out * c_out,
+        "conv2d_f32_nhwc: output size mismatch"
+    );
+
+    // Direct convolution: iterate over each output position
+    for batch in 0..n {
+        for oh in 0..h_out {
+            for ow in 0..w_out {
+                for oc in 0..c_out {
+                    let mut acc: f32 = 0.0;
+
+                    // Convolve over the kernel
+                    for kh in 0..k_h {
+                        for kw in 0..k_w {
+                            // Input position (with padding offset)
+                            let ih = (oh * stride_h + kh) as isize - pad_h as isize;
+                            let iw = (ow * stride_w + kw) as isize - pad_w as isize;
+
+                            // Skip if outside input bounds (zero-padding)
+                            if ih < 0 || ih >= h_in as isize || iw < 0 || iw >= w_in as isize {
+                                continue;
+                            }
+
+                            let ih = ih as usize;
+                            let iw = iw as usize;
+
+                            // Sum over input channels
+                            for ic in 0..c_in {
+                                // Input index: [batch, ih, iw, ic] in NHWC
+                                let input_idx =
+                                    ((batch * h_in + ih) * w_in + iw) * c_in + ic;
+                                // Kernel index: [kh, kw, ic, oc]
+                                let kernel_idx =
+                                    ((kh * k_w + kw) * c_in + ic) * c_out + oc;
+
+                                acc = input[input_idx].mul_add(kernel[kernel_idx], acc);
+                            }
+                        }
+                    }
+
+                    // Output index: [batch, oh, ow, oc] in NHWC
+                    let output_idx = ((batch * h_out + oh) * w_out + ow) * c_out + oc;
+                    output[output_idx] = acc;
+                }
+            }
+        }
+    }
+}
+
+/// 2D convolution in NHWC format with F16 data.
+///
+/// Same as `conv2d_f32_nhwc` but with F16 inputs/outputs and F32 accumulator.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_fp16_nhwc(
+    output: &mut [F16],
+    input: &[F16],
+    kernel: &[F16],
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    c_out: usize,
+    k_h: usize,
+    k_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) {
+    let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+    let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+
+    assert_eq!(input.len(), n * h_in * w_in * c_in);
+    assert_eq!(kernel.len(), k_h * k_w * c_in * c_out);
+    assert_eq!(output.len(), n * h_out * w_out * c_out);
+
+    for batch in 0..n {
+        for oh in 0..h_out {
+            for ow in 0..w_out {
+                for oc in 0..c_out {
+                    let mut acc: f32 = 0.0;
+
+                    for kh in 0..k_h {
+                        for kw in 0..k_w {
+                            let ih = (oh * stride_h + kh) as isize - pad_h as isize;
+                            let iw = (ow * stride_w + kw) as isize - pad_w as isize;
+
+                            if ih < 0 || ih >= h_in as isize || iw < 0 || iw >= w_in as isize {
+                                continue;
+                            }
+
+                            let ih = ih as usize;
+                            let iw = iw as usize;
+
+                            for ic in 0..c_in {
+                                let input_idx = ((batch * h_in + ih) * w_in + iw) * c_in + ic;
+                                let kernel_idx = ((kh * k_w + kw) * c_in + ic) * c_out + oc;
+
+                                let i_f32 = input[input_idx].to_f32();
+                                let k_f32 = kernel[kernel_idx].to_f32();
+                                acc = i_f32.mul_add(k_f32, acc);
+                            }
+                        }
+                    }
+
+                    let output_idx = ((batch * h_out + oh) * w_out + ow) * c_out + oc;
+                    output[output_idx] = F16::from_f32(acc);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pooling operations
+// ---------------------------------------------------------------------------
+
+/// 2D max pooling in NHWC format.
+///
+/// * `input`: `[N, H_in, W_in, C]`
+/// * `output`: `[N, H_out, W_out, C]`
+///
+/// Pool size and stride are both `(pool_h, pool_w)`.
+#[allow(clippy::too_many_arguments)]
+pub fn maxpool2d_f32_nhwc(
+    output: &mut [f32],
+    input: &[f32],
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c: usize,
+    pool_h: usize,
+    pool_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+) {
+    let h_out = (h_in - pool_h) / stride_h + 1;
+    let w_out = (w_in - pool_w) / stride_w + 1;
+
+    assert_eq!(input.len(), n * h_in * w_in * c);
+    assert_eq!(output.len(), n * h_out * w_out * c);
+
+    for batch in 0..n {
+        for oh in 0..h_out {
+            for ow in 0..w_out {
+                for ch in 0..c {
+                    let mut max_val = f32::NEG_INFINITY;
+
+                    for ph in 0..pool_h {
+                        for pw in 0..pool_w {
+                            let ih = oh * stride_h + ph;
+                            let iw = ow * stride_w + pw;
+                            let idx = ((batch * h_in + ih) * w_in + iw) * c + ch;
+                            max_val = max_val.max(input[idx]);
+                        }
+                    }
+
+                    let output_idx = ((batch * h_out + oh) * w_out + ow) * c + ch;
+                    output[output_idx] = max_val;
+                }
+            }
+        }
+    }
+}
+
+/// 2D average pooling in NHWC format.
+#[allow(clippy::too_many_arguments)]
+pub fn avgpool2d_f32_nhwc(
+    output: &mut [f32],
+    input: &[f32],
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c: usize,
+    pool_h: usize,
+    pool_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+) {
+    let h_out = (h_in - pool_h) / stride_h + 1;
+    let w_out = (w_in - pool_w) / stride_w + 1;
+    let pool_size = (pool_h * pool_w) as f32;
+
+    assert_eq!(input.len(), n * h_in * w_in * c);
+    assert_eq!(output.len(), n * h_out * w_out * c);
+
+    for batch in 0..n {
+        for oh in 0..h_out {
+            for ow in 0..w_out {
+                for ch in 0..c {
+                    let mut sum: f32 = 0.0;
+
+                    for ph in 0..pool_h {
+                        for pw in 0..pool_w {
+                            let ih = oh * stride_h + ph;
+                            let iw = ow * stride_w + pw;
+                            let idx = ((batch * h_in + ih) * w_in + iw) * c + ch;
+                            sum += input[idx];
+                        }
+                    }
+
+                    let output_idx = ((batch * h_out + oh) * w_out + ow) * c + ch;
+                    output[output_idx] = sum / pool_size;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Softmax
+// ---------------------------------------------------------------------------
+
+/// Softmax along the last axis.
+///
+/// * `input`: `[..., N]` — any shape, softmax over the last dimension
+/// * `output`: same shape as input
+/// * `n`: size of the last dimension
+///
+/// For numerical stability, uses the max-subtraction trick.
+pub fn softmax_f32(output: &mut [f32], input: &[f32], n: usize) {
+    assert_eq!(input.len(), output.len());
+    assert_eq!(input.len() % n, 0);
+
+    let num_rows = input.len() / n;
+
+    for row in 0..num_rows {
+        let start = row * n;
+        let end = start + n;
+        let row_in = &input[start..end];
+        let row_out = &mut output[start..end];
+
+        // Find max for numerical stability
+        let max_val = row_in.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        // Compute exp(x - max) and sum
+        let mut sum: f32 = 0.0;
+        for (out, &inp) in row_out.iter_mut().zip(row_in.iter()) {
+            let exp_val = (inp - max_val).exp();
+            *out = exp_val;
+            sum += exp_val;
+        }
+
+        // Normalize
+        let inv_sum = 1.0 / sum;
+        for out in row_out.iter_mut() {
+            *out *= inv_sum;
+        }
+    }
 }

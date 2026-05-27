@@ -50,6 +50,12 @@ pub enum OpKind {
     GemmF32,
     /// `gemm_f32_tiled.spv` — 3 SSBOs (C output, A, B), tiled with shared memory
     GemmF32Tiled,
+    /// `conv2d_f32_nhwc.spv` — 3 SSBOs (output, input, kernel)
+    Conv2dF32Nhwc,
+    /// `maxpool2d_f32.spv` — 2 SSBOs (output, input)
+    Maxpool2dF32,
+    /// `softmax_f32.spv` — 2 SSBOs (output, input)
+    SoftmaxF32,
 
     // -----------------------------------------------------------------------
     // FP16 ops
@@ -75,6 +81,8 @@ impl OpKind {
             OpKind::ReluF32 | OpKind::ReluFp16 => 1,
             OpKind::AddF32 | OpKind::AddFp16 => 3,
             OpKind::GemmF32 | OpKind::GemmF32Tiled | OpKind::GemmFp16 => 3,
+            OpKind::Conv2dF32Nhwc => 3,
+            OpKind::Maxpool2dF32 | OpKind::SoftmaxF32 => 2,
         }
     }
 
@@ -87,6 +95,9 @@ impl OpKind {
             OpKind::AddF32 => dragonwing_shaders::ADD_F32,
             OpKind::GemmF32 => dragonwing_shaders::GEMM_F32_NAIVE,
             OpKind::GemmF32Tiled => dragonwing_shaders::GEMM_F32_TILED,
+            OpKind::Conv2dF32Nhwc => dragonwing_shaders::CONV2D_F32_NHWC,
+            OpKind::Maxpool2dF32 => dragonwing_shaders::MAXPOOL2D_F32,
+            OpKind::SoftmaxF32 => dragonwing_shaders::SOFTMAX_F32,
             OpKind::FillFp16 => dragonwing_shaders::FILL_FP16,
             OpKind::AxpyFp16 => dragonwing_shaders::AXPY_FP16,
             OpKind::ReluFp16 => dragonwing_shaders::RELU_FP16,
@@ -97,13 +108,15 @@ impl OpKind {
 
     /// Push-constant size in bytes. Must match the shader's push_constant layout.
     pub const fn push_constant_size(self) -> u32 {
-        // All ops currently use 16-byte push constants for uniformity
         match self {
             OpKind::FillF32 | OpKind::FillFp16 => 16,
             OpKind::AxpyF32 | OpKind::AxpyFp16 => 16,
             OpKind::ReluF32 | OpKind::ReluFp16 => 16,
             OpKind::AddF32 | OpKind::AddFp16 => 16,
             OpKind::GemmF32 | OpKind::GemmF32Tiled | OpKind::GemmFp16 => 16,
+            OpKind::SoftmaxF32 => 16,
+            // Conv2d and Maxpool have larger push constants (64 bytes)
+            OpKind::Conv2dF32Nhwc | OpKind::Maxpool2dF32 => 64,
         }
     }
 }

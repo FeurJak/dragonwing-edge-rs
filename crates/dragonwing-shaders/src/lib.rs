@@ -87,6 +87,30 @@ pub const GEMM_F32_TILED: &[u8] =
 pub const GEMM_FP16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_fp16.spv"));
 
 // ===========================================================================
+// Convolution and pooling shaders
+// ===========================================================================
+
+/// `conv2d_f32_nhwc` — Direct 2D convolution in NHWC format.
+///
+/// Push-constant layout: 64 bytes (4 uvec4).
+/// Dispatch: `gx = ceil(w_out/8), gy = ceil(h_out/8), gz = n * c_out`.
+pub const CONV2D_F32_NHWC: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/conv2d_f32_nhwc.spv"));
+
+/// `maxpool2d_f32` — 2D max pooling in NHWC format.
+///
+/// Push-constant layout: 64 bytes (4 uvec4).
+/// Dispatch: `gx = ceil(w_out/8), gy = ceil(h_out/8), gz = n * c`.
+pub const MAXPOOL2D_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/maxpool2d_f32.spv"));
+
+/// `softmax_f32` — Softmax along last axis with workgroup reduction.
+///
+/// Push-constant layout: `{ uint n; uint rows; uint _; uint _; }`.
+/// Dispatch: `gx = 1, gy = rows, gz = 1`.
+pub const SOFTMAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/softmax_f32.spv"));
+
+// ===========================================================================
 // FP16 shaders (require VK_KHR_16bit_storage + shaderFloat16)
 // ===========================================================================
 
@@ -124,6 +148,9 @@ pub const ALL: &[(&str, &[u8])] = &[
     ("add_f32", ADD_F32),
     ("gemm_f32_naive", GEMM_F32_NAIVE),
     ("gemm_f32_tiled", GEMM_F32_TILED),
+    ("conv2d_f32_nhwc", CONV2D_F32_NHWC),
+    ("maxpool2d_f32", MAXPOOL2D_F32),
+    ("softmax_f32", SOFTMAX_F32),
     ("fill_fp16", FILL_FP16),
     ("axpy_fp16", AXPY_FP16),
     ("relu_fp16", RELU_FP16),
