@@ -72,6 +72,9 @@
 #![warn(missing_docs)]
 
 pub mod ops;
+pub mod pool;
+
+pub use pool::{num_cpus, parallel_for_scoped, SendPtr, ThreadPool};
 
 use dragonwing_core::error::Error;
 use dragonwing_core::{Backend, BackendBuffer, BufferKind, Result};

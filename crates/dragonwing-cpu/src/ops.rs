@@ -775,6 +775,83 @@ mod tests {
         assert!(output[0] < output[1] && output[1] < output[2], "softmax should preserve order");
         assert!(output.iter().all(|&x| x > 0.0), "softmax outputs should be positive");
     }
+
+    // -----------------------------------------------------------------------
+    // Multi-threaded tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gemm_f32_mt_matches_naive() {
+        let m = 64;
+        let n = 64;
+        let k = 64;
+
+        // Random-ish input
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01).sin()).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.02).cos()).collect();
+
+        let mut c_naive = vec![0.0f32; m * n];
+        let mut c_mt = vec![0.0f32; m * n];
+
+        super::gemm_f32_naive(&mut c_naive, &a, &b, m, n, k);
+        super::gemm_f32_mt(&mut c_mt, &a, &b, m, n, k, 4);
+
+        for i in 0..m * n {
+            let diff = (c_naive[i] - c_mt[i]).abs();
+            let tol = 1e-4 * c_naive[i].abs().max(1.0);
+            assert!(
+                diff < tol,
+                "gemm_f32_mt mismatch at {i}: naive={} mt={}",
+                c_naive[i],
+                c_mt[i]
+            );
+        }
+    }
+
+    #[test]
+    fn conv2d_f32_mt_matches_st() {
+        let n = 1;
+        let h_in = 14;
+        let w_in = 14;
+        let c_in = 16;
+        let c_out = 32;
+        let k = 3;
+        let stride = 1;
+        let pad = 1;
+
+        let input: Vec<f32> = (0..n * h_in * w_in * c_in)
+            .map(|i| (i as f32 * 0.01).sin())
+            .collect();
+        let kernel: Vec<f32> = (0..k * k * c_in * c_out)
+            .map(|i| (i as f32 * 0.02).cos())
+            .collect();
+
+        let h_out = (h_in + 2 * pad - k) / stride + 1;
+        let w_out = (w_in + 2 * pad - k) / stride + 1;
+
+        let mut output_st = vec![0.0f32; n * h_out * w_out * c_out];
+        let mut output_mt = vec![0.0f32; n * h_out * w_out * c_out];
+
+        super::conv2d_f32_nhwc(
+            &mut output_st, &input, &kernel,
+            n, h_in, w_in, c_in, c_out, k, k, stride, stride, pad, pad
+        );
+        super::conv2d_f32_nhwc_mt(
+            &mut output_mt, &input, &kernel,
+            n, h_in, w_in, c_in, c_out, k, k, stride, stride, pad, pad, 4
+        );
+
+        for i in 0..output_st.len() {
+            let diff = (output_st[i] - output_mt[i]).abs();
+            let tol = 1e-4 * output_st[i].abs().max(1.0);
+            assert!(
+                diff < tol,
+                "conv2d_f32_mt mismatch at {i}: st={} mt={}",
+                output_st[i],
+                output_mt[i]
+            );
+        }
+    }
 }
 
 // ===========================================================================
@@ -1090,4 +1167,286 @@ pub fn softmax_f32(output: &mut [f32], input: &[f32], n: usize) {
             *out *= inv_sum;
         }
     }
+}
+
+// ===========================================================================
+// Multi-threaded ops
+// ===========================================================================
+
+use crate::pool::{num_cpus, parallel_for_scoped, SendPtr};
+
+/// Multi-threaded GEMM: `C = A * B`.
+///
+/// Parallelizes over the M dimension (rows of C). Uses `std::thread::scope`
+/// for scoped parallelism without 'static lifetime requirements.
+///
+/// * `a`: `[m, k]` row-major
+/// * `b`: `[k, n]` row-major  
+/// * `c`: `[m, n]` row-major (output)
+/// * `num_threads`: number of threads to use (clamped to 1..=num_cpus)
+///
+/// # Panics
+///
+/// Panics if buffer sizes don't match.
+pub fn gemm_f32_mt(
+    c: &mut [f32],
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    num_threads: usize,
+) {
+    assert_eq!(a.len(), m * k, "gemm_f32_mt: A size mismatch");
+    assert_eq!(b.len(), k * n, "gemm_f32_mt: B size mismatch");
+    assert_eq!(c.len(), m * n, "gemm_f32_mt: C size mismatch");
+
+    // For small matrices, single-threaded is faster due to thread overhead
+    if m * n * k < 4096 || num_threads <= 1 {
+        gemm_f32_naive(c, a, b, m, n, k);
+        return;
+    }
+
+    let num_threads = num_threads.min(m).min(num_cpus());
+
+    // SAFETY: We partition the output by row so threads write non-overlapping regions.
+    // Input arrays are read-only and shared safely. The pointers remain valid
+    // for the scope of parallel_for_scoped (scoped threads).
+    let c_ptr = unsafe { SendPtr::new(c.as_mut_ptr()) };
+    let a_ptr = unsafe { SendPtr::from_const(a.as_ptr()) };
+    let b_ptr = unsafe { SendPtr::from_const(b.as_ptr()) };
+
+    parallel_for_scoped(num_threads, m, |row_start, row_end| {
+        // SAFETY: Each thread writes to non-overlapping rows of c.
+        // a and b are read-only and shared safely.
+        unsafe {
+            for i in row_start..row_end {
+                for j in 0..n {
+                    let mut acc: f32 = 0.0;
+                    for p in 0..k {
+                        let a_val = *a_ptr.as_const_ptr().add(i * k + p);
+                        let b_val = *b_ptr.as_const_ptr().add(p * n + j);
+                        acc = a_val.mul_add(b_val, acc);
+                    }
+                    *c_ptr.as_ptr().add(i * n + j) = acc;
+                }
+            }
+        }
+    });
+}
+
+/// Multi-threaded FP16 GEMM with F32 accumulator.
+///
+/// Same as `gemm_f32_mt` but with F16 inputs/outputs.
+pub fn gemm_fp16_mt(
+    c: &mut [F16],
+    a: &[F16],
+    b: &[F16],
+    m: usize,
+    n: usize,
+    k: usize,
+    num_threads: usize,
+) {
+    assert_eq!(a.len(), m * k, "gemm_fp16_mt: A size mismatch");
+    assert_eq!(b.len(), k * n, "gemm_fp16_mt: B size mismatch");
+    assert_eq!(c.len(), m * n, "gemm_fp16_mt: C size mismatch");
+
+    if m * n * k < 4096 || num_threads <= 1 {
+        gemm_fp16(c, a, b, m, n, k);
+        return;
+    }
+
+    let num_threads = num_threads.min(m).min(num_cpus());
+
+    // SAFETY: Same as gemm_f32_mt
+    let c_ptr = unsafe { SendPtr::new(c.as_mut_ptr()) };
+    let a_ptr = unsafe { SendPtr::from_const(a.as_ptr()) };
+    let b_ptr = unsafe { SendPtr::from_const(b.as_ptr()) };
+
+    parallel_for_scoped(num_threads, m, |row_start, row_end| {
+        unsafe {
+            for i in row_start..row_end {
+                for j in 0..n {
+                    let mut acc: f32 = 0.0;
+                    for p in 0..k {
+                        let a_f32 = (*a_ptr.as_const_ptr().add(i * k + p)).to_f32();
+                        let b_f32 = (*b_ptr.as_const_ptr().add(p * n + j)).to_f32();
+                        acc = a_f32.mul_add(b_f32, acc);
+                    }
+                    *c_ptr.as_ptr().add(i * n + j) = F16::from_f32(acc);
+                }
+            }
+        }
+    });
+}
+
+/// Multi-threaded 2D convolution in NHWC format.
+///
+/// Parallelizes over the H_out dimension (output rows). For small outputs,
+/// falls back to single-threaded.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_f32_nhwc_mt(
+    output: &mut [f32],
+    input: &[f32],
+    kernel: &[f32],
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    c_out: usize,
+    k_h: usize,
+    k_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+    num_threads: usize,
+) {
+    let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+    let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+
+    assert_eq!(input.len(), n * h_in * w_in * c_in);
+    assert_eq!(kernel.len(), k_h * k_w * c_in * c_out);
+    assert_eq!(output.len(), n * h_out * w_out * c_out);
+
+    // For small outputs, single-threaded is faster
+    let total_work = n * h_out * w_out * c_out * k_h * k_w * c_in;
+    if total_work < 8192 || num_threads <= 1 {
+        conv2d_f32_nhwc(output, input, kernel, n, h_in, w_in, c_in, c_out, k_h, k_w, stride_h, stride_w, pad_h, pad_w);
+        return;
+    }
+
+    let num_threads = num_threads.min(n * h_out).min(num_cpus());
+
+    // SAFETY: Same reasoning as gemm_f32_mt - threads write non-overlapping output rows
+    let output_ptr = unsafe { SendPtr::new(output.as_mut_ptr()) };
+    let input_ptr = unsafe { SendPtr::from_const(input.as_ptr()) };
+    let kernel_ptr = unsafe { SendPtr::from_const(kernel.as_ptr()) };
+
+    // Parallelize over batch * h_out
+    let total_rows = n * h_out;
+
+    parallel_for_scoped(num_threads, total_rows, |row_start, row_end| {
+        unsafe {
+            for row_idx in row_start..row_end {
+                let batch = row_idx / h_out;
+                let oh = row_idx % h_out;
+
+                for ow in 0..w_out {
+                    for oc in 0..c_out {
+                        let mut acc: f32 = 0.0;
+
+                        for kh in 0..k_h {
+                            for kw in 0..k_w {
+                                let ih = (oh * stride_h + kh) as isize - pad_h as isize;
+                                let iw = (ow * stride_w + kw) as isize - pad_w as isize;
+
+                                if ih < 0 || ih >= h_in as isize || iw < 0 || iw >= w_in as isize {
+                                    continue;
+                                }
+
+                                let ih = ih as usize;
+                                let iw = iw as usize;
+
+                                for ic in 0..c_in {
+                                    let input_idx = ((batch * h_in + ih) * w_in + iw) * c_in + ic;
+                                    let kernel_idx = ((kh * k_w + kw) * c_in + ic) * c_out + oc;
+
+                                    let i_val = *input_ptr.as_const_ptr().add(input_idx);
+                                    let k_val = *kernel_ptr.as_const_ptr().add(kernel_idx);
+                                    acc = i_val.mul_add(k_val, acc);
+                                }
+                            }
+                        }
+
+                        let output_idx = ((batch * h_out + oh) * w_out + ow) * c_out + oc;
+                        *output_ptr.as_ptr().add(output_idx) = acc;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Multi-threaded FP16 2D convolution.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_fp16_nhwc_mt(
+    output: &mut [F16],
+    input: &[F16],
+    kernel: &[F16],
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    c_out: usize,
+    k_h: usize,
+    k_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+    num_threads: usize,
+) {
+    let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+    let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+
+    assert_eq!(input.len(), n * h_in * w_in * c_in);
+    assert_eq!(kernel.len(), k_h * k_w * c_in * c_out);
+    assert_eq!(output.len(), n * h_out * w_out * c_out);
+
+    let total_work = n * h_out * w_out * c_out * k_h * k_w * c_in;
+    if total_work < 8192 || num_threads <= 1 {
+        conv2d_fp16_nhwc(output, input, kernel, n, h_in, w_in, c_in, c_out, k_h, k_w, stride_h, stride_w, pad_h, pad_w);
+        return;
+    }
+
+    let num_threads = num_threads.min(n * h_out).min(num_cpus());
+
+    // SAFETY: Same reasoning as above
+    let output_ptr = unsafe { SendPtr::new(output.as_mut_ptr()) };
+    let input_ptr = unsafe { SendPtr::from_const(input.as_ptr()) };
+    let kernel_ptr = unsafe { SendPtr::from_const(kernel.as_ptr()) };
+
+    let total_rows = n * h_out;
+
+    parallel_for_scoped(num_threads, total_rows, |row_start, row_end| {
+        unsafe {
+            for row_idx in row_start..row_end {
+                let batch = row_idx / h_out;
+                let oh = row_idx % h_out;
+
+                for ow in 0..w_out {
+                    for oc in 0..c_out {
+                        let mut acc: f32 = 0.0;
+
+                        for kh in 0..k_h {
+                            for kw in 0..k_w {
+                                let ih = (oh * stride_h + kh) as isize - pad_h as isize;
+                                let iw = (ow * stride_w + kw) as isize - pad_w as isize;
+
+                                if ih < 0 || ih >= h_in as isize || iw < 0 || iw >= w_in as isize {
+                                    continue;
+                                }
+
+                                let ih = ih as usize;
+                                let iw = iw as usize;
+
+                                for ic in 0..c_in {
+                                    let input_idx = ((batch * h_in + ih) * w_in + iw) * c_in + ic;
+                                    let kernel_idx = ((kh * k_w + kw) * c_in + ic) * c_out + oc;
+
+                                    let i_f32 = (*input_ptr.as_const_ptr().add(input_idx)).to_f32();
+                                    let k_f32 = (*kernel_ptr.as_const_ptr().add(kernel_idx)).to_f32();
+                                    acc = i_f32.mul_add(k_f32, acc);
+                                }
+                            }
+                        }
+
+                        let output_idx = ((batch * h_out + oh) * w_out + ow) * c_out + oc;
+                        *output_ptr.as_ptr().add(output_idx) = F16::from_f32(acc);
+                    }
+                }
+            }
+        }
+    });
 }
