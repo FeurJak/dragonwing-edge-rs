@@ -1,7 +1,6 @@
 //! Debug binary to investigate device selection.
 
 use dragonwing_vulkan::{VulkanBackend, VulkanConfig};
-use dragonwing_core::Backend;
 
 fn main() {
     println!("=== Vulkan Device Selection Debug ===\n");

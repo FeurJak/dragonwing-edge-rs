@@ -4,6 +4,7 @@
 
 /// Simple linear congruential generator for deterministic pseudo-random f32s.
 /// Not cryptographically secure, but fast and reproducible.
+#[derive(Debug)]
 pub struct Rng {
     state: u64,
 }

@@ -90,6 +90,7 @@ impl TestResults {
 }
 
 /// Parity test runner.
+#[derive(Debug)]
 pub struct ParityTest;
 
 impl ParityTest {
