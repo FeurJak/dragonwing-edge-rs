@@ -1,0 +1,21 @@
+[package]
+name = "dragonwing-hal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Hardware abstraction layer: probes CPU/GPU/DSP capabilities on the QRB2210."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Forward serde derives onto the capability types.
+serde = ["dragonwing-core/serde"]
+
+[dependencies]
+# Internal only. Justified: shared type system for the workspace.
+dragonwing-core = { path = "../dragonwing-core" }

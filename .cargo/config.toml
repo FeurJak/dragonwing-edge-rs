@@ -1,0 +1,34 @@
+# Cross-compilation configuration for the Arduino UNO Q (Qualcomm QRB2210).
+#
+# Two target triples are supported:
+#
+#   aarch64-unknown-linux-gnu   — dynamic glibc build. Matches the on-device
+#                                 Debian 13 (trixie) glibc 2.41 ABI. Requires a
+#                                 cross linker; we point at a Homebrew-installed
+#                                 aarch64 GCC if present. If you don't have one,
+#                                 use the musl target below instead.
+#
+#   aarch64-unknown-linux-musl  — static musl build. No glibc ABI concerns,
+#                                 binary is a single self-contained ELF. Use
+#                                 this for the probe binary when no cross
+#                                 toolchain is installed locally. Linked with
+#                                 rust-lld so no external linker is needed.
+#
+# Pick one when invoking cargo:
+#   cargo build -p dragonwing-probe --target aarch64-unknown-linux-musl --release
+#   cargo build -p dragonwing-probe --target aarch64-unknown-linux-gnu  --release
+
+[target.aarch64-unknown-linux-gnu]
+# Homebrew: `brew install aarch64-unknown-linux-gnu` (messense tap) provides
+# this. Override via env var CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER if
+# your toolchain is elsewhere.
+linker = "aarch64-unknown-linux-gnu-gcc"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[alias]
+# Convenience aliases.
+probe-musl = "build -p dragonwing-probe --target aarch64-unknown-linux-musl --release"
+probe-gnu  = "build -p dragonwing-probe --target aarch64-unknown-linux-gnu  --release"

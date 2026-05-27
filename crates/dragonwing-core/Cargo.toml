@@ -1,0 +1,21 @@
+[package]
+name = "dragonwing-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared types and traits for the dragonwing-edge inference framework."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enables serde derives on public types. Optional so the core crate has zero
+# mandatory dependencies (per project.md: minimal external deps).
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { workspace = true, optional = true }

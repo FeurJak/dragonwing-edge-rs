@@ -1,0 +1,20 @@
+[package]
+name = "dragonwing-edge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Edge-inference framework for the Qualcomm QRB2210 (Arduino UNO Q). Façade crate."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+serde = ["dragonwing-core/serde", "dragonwing-hal/serde"]
+
+[dependencies]
+dragonwing-core = { path = "../dragonwing-core" }
+dragonwing-hal = { path = "../dragonwing-hal" }

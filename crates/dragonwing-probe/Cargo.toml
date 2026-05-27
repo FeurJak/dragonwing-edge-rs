@@ -1,0 +1,24 @@
+[package]
+name = "dragonwing-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CLI binary that emits a HardwareCapabilities JSON report for the running device."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "dragonwing-probe"
+path = "src/main.rs"
+
+[dependencies]
+dragonwing-hal = { path = "../dragonwing-hal", features = ["serde"] }
+dragonwing-core = { path = "../dragonwing-core", features = ["serde"] }
+# Justified: structured JSON output is the entire purpose of this binary.
+# Hand-rolling JSON for a 10-field nested struct is more error-prone than the
+# transitive dep cost. `default-features = false` keeps build slim.
+serde_json = { workspace = true, features = ["std"] }
