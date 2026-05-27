@@ -5,6 +5,10 @@ members = [
     "crates/dragonwing-core",
     "crates/dragonwing-hal",
     "crates/dragonwing-probe",
+    "crates/dragonwing-cpu",
+    "crates/dragonwing-shaders",
+    "crates/dragonwing-vulkan",
+    "crates/dragonwing-test",
 ]
 
 [workspace.package]

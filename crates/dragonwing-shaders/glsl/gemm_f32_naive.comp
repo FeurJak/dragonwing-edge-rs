@@ -1,0 +1,61 @@
+#version 450
+//
+// gemm_f32_naive — C = A * B, row-major.
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer C[m*n]   (write-only)
+//   set=0 binding=1  std430 buffer A[m*k]   (read-only)
+//   set=0 binding=2  std430 buffer B[k*n]   (read-only)
+//
+// Push constants (16 bytes):
+//   uint m
+//   uint n
+//   uint k
+//   uint _pad
+//
+// Dispatch:
+//   gx = ceil(n / 16), gy = ceil(m / 16), gz = 1.
+//
+// Workgroup: 16x16x1 = 256 invocations — well under the 512-invocation
+// cap on Adreno A702 (`maxComputeWorkGroupInvocations`).
+//
+// Each invocation computes one output element C[row, col] by reading the
+// full A row and B column. No tiling, no shared-memory caching. This is
+// the *reference* implementation; the tiled / FP16 / INT8 variants are
+// task 003.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer CBuf {
+    float c[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer ABuf {
+    float a[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer BBuf {
+    float b[];
+};
+
+layout(push_constant) uniform Pc {
+    uint m;
+    uint n;
+    uint k;
+    uint _pad;
+} pc;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x; // [0, n)
+    uint row = gl_GlobalInvocationID.y; // [0, m)
+    if (row >= pc.m || col >= pc.n) {
+        return;
+    }
+
+    float acc = 0.0;
+    for (uint p = 0u; p < pc.k; p++) {
+        // fma() mirrors the CPU reference's f32::mul_add. See axpy_f32.comp.
+        acc = fma(a[row * pc.k + p], b[p * pc.n + col], acc);
+    }
+    c[row * pc.n + col] = acc;
+}

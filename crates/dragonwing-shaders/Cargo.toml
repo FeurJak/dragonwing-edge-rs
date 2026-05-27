@@ -1,0 +1,17 @@
+[package]
+name = "dragonwing-shaders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Compiled SPIR-V compute shaders for the dragonwing-vulkan backend."
+build = "build.rs"
+
+[lints]
+workspace = true
+
+# Zero dependencies. The build script uses only the stdlib + an external
+# `glslangValidator` command (optional — falls back to checked-in `.spv`).
+[dependencies]

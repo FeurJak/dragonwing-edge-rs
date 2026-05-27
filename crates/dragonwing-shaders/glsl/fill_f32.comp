@@ -1,0 +1,41 @@
+#version 450
+//
+// fill_f32 — write a scalar value into every element of an f32 buffer.
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Y[]   (write-only)
+//
+// Push constants (16 bytes):
+//   uint  n        — element count (in floats)
+//   float v        — value to write
+//   float _pad0    — unused (kept for layout symmetry with axpy)
+//   float _pad1    — unused
+//
+// Dispatch:
+//   gx = ceil(n / 64). gy = gz = 1.
+//
+// Workgroup size:
+//   64 x 1 x 1. Each invocation writes one element. 64 is chosen as a
+//   multiple of the Adreno A702 fiber size that fits comfortably under
+//   the 512-invocation cap on the QRB2210.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer YBuf {
+    float y[];
+};
+
+layout(push_constant) uniform Pc {
+    uint  n;
+    float v;
+    float _pad0;
+    float _pad1;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.n) {
+        return;
+    }
+    y[gid] = pc.v;
+}

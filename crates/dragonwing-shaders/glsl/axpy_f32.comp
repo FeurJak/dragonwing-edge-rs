@@ -1,0 +1,47 @@
+#version 450
+//
+// axpy_f32 — y[i] = a * x[i] + y[i].
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Y[]   (read+write)
+//   set=0 binding=1  std430 buffer X[]   (read-only)
+//
+// Push constants (16 bytes):
+//   uint  n         — element count
+//   float a         — scalar multiplier
+//   float _pad0
+//   float _pad1
+//
+// Dispatch:
+//   gx = ceil(n / 64). gy = gz = 1.
+//
+// Numerical note:
+//   The shader uses `fma(a, x[i], y[i])` to mirror the CPU backend's
+//   `f32::mul_add`, which in turn mirrors NEON's vfmaq_f32. Without
+//   `fma()` the GLSL compiler is allowed to emit a separate mul+add with
+//   two roundings, which would break cross-backend parity testing.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer YBuf {
+    float y[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer XBuf {
+    float x[];
+};
+
+layout(push_constant) uniform Pc {
+    uint  n;
+    float a;
+    float _pad0;
+    float _pad1;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.n) {
+        return;
+    }
+    y[gid] = fma(pc.a, x[gid], y[gid]);
+}
