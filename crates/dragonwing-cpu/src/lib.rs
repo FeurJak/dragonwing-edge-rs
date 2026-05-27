@@ -72,6 +72,9 @@
 #![warn(missing_docs)]
 
 pub mod ops;
+pub mod pool;
+
+pub use pool::{num_cpus, parallel_for_scoped, SendPtr, ThreadPool};
 
 use dragonwing_core::error::Error;
 use dragonwing_core::{Backend, BackendBuffer, BufferKind, Result};
@@ -140,6 +143,51 @@ impl CpuBuffer {
             core::slice::from_raw_parts_mut(
                 self.data.as_mut_ptr().cast::<f32>(),
                 self.data.len() / core::mem::size_of::<f32>(),
+            )
+        }
+    }
+
+    /// View the buffer as a `&[F16]`. Panics if `len_bytes` is not a
+    /// multiple of 2.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len_bytes` is not a multiple of 2.
+    #[must_use]
+    pub fn as_f16(&self) -> &[dragonwing_core::F16] {
+        assert!(
+            self.data.len() % core::mem::size_of::<dragonwing_core::F16>() == 0,
+            "CpuBuffer::as_f16: length {} is not a multiple of 2",
+            self.data.len()
+        );
+        // SAFETY: F16 is repr(transparent) over u16, which has alignment 2.
+        // Vec<u8> is at least 4-byte aligned, satisfying the requirement.
+        // Any bit pattern is valid for F16 (it's just stored bits).
+        unsafe {
+            core::slice::from_raw_parts(
+                self.data.as_ptr().cast::<dragonwing_core::F16>(),
+                self.data.len() / core::mem::size_of::<dragonwing_core::F16>(),
+            )
+        }
+    }
+
+    /// Mutable `&mut [F16]` view. Same alignment / length contract as
+    /// [`as_f16`](Self::as_f16).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len_bytes` is not a multiple of 2.
+    pub fn as_f16_mut(&mut self) -> &mut [dragonwing_core::F16] {
+        assert!(
+            self.data.len() % core::mem::size_of::<dragonwing_core::F16>() == 0,
+            "CpuBuffer::as_f16_mut: length {} is not a multiple of 2",
+            self.data.len()
+        );
+        // SAFETY: see `as_f16` — same reasoning.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.data.as_mut_ptr().cast::<dragonwing_core::F16>(),
+                self.data.len() / core::mem::size_of::<dragonwing_core::F16>(),
             )
         }
     }

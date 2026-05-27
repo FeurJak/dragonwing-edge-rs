@@ -1,0 +1,44 @@
+#version 450
+//
+// relu_fp16 — in-place ReLU: x[i] = max(0, x[i]) with F16 data.
+//
+// Extensions required:
+//   GL_EXT_shader_16bit_storage       — for float16_t SSBO load/store
+//   GL_EXT_shader_explicit_arithmetic_types_float16 — for float16_t type
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer X[]   (read+write, in-place, float16_t)
+//
+// Push constants (16 bytes):
+//   uint  n         — element count
+//   uint  _pad0
+//   uint  _pad1
+//   uint  _pad2
+//
+// Dispatch:
+//   gx = ceil(n / 64). gy = gz = 1.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer XBuf {
+    float16_t x[];
+};
+
+layout(push_constant) uniform Pc {
+    uint  n;
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.n) {
+        return;
+    }
+    // max() works directly on float16_t in GLSL with the extension
+    x[gid] = max(float16_t(0.0), x[gid]);
+}

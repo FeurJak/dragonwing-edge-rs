@@ -1,0 +1,122 @@
+#version 450
+//
+// gemm_f32_tiled — C = A * B, row-major, tiled with shared memory.
+//
+// This is the optimized GEMM for Adreno A702. Uses a 16x16 output tile per
+// workgroup, with shared-memory blocking to improve memory locality.
+//
+// Tile strategy:
+//   - Each workgroup computes a 16x16 tile of C
+//   - K dimension is processed in blocks of TILE_K (16)
+//   - Each thread computes 1 element of the output tile
+//   - Shared memory holds A tile (16 x TILE_K) and B tile (TILE_K x 16)
+//
+// Shared memory usage:
+//   - A_shared: 16 * 16 * 4 = 1024 bytes
+//   - B_shared: 16 * 16 * 4 = 1024 bytes
+//   - Total: 2048 bytes (well under 16 KiB limit)
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer C[m*n]   (write-only)
+//   set=0 binding=1  std430 buffer A[m*k]   (read-only)
+//   set=0 binding=2  std430 buffer B[k*n]   (read-only)
+//
+// Push constants (16 bytes):
+//   uint m
+//   uint n
+//   uint k
+//   uint _pad
+//
+// Dispatch:
+//   gx = ceil(n / 16), gy = ceil(m / 16), gz = 1.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Tile dimensions
+const uint TILE_M = 16u;
+const uint TILE_N = 16u;
+const uint TILE_K = 16u;
+
+// Shared memory for tiled loading
+shared float A_shared[TILE_M][TILE_K];
+shared float B_shared[TILE_K][TILE_N];
+
+layout(set = 0, binding = 0, std430) writeonly buffer CBuf {
+    float c[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer ABuf {
+    float a[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer BBuf {
+    float b[];
+};
+
+layout(push_constant) uniform Pc {
+    uint m;
+    uint n;
+    uint k;
+    uint _pad;
+} pc;
+
+void main() {
+    // Global row and column this thread is responsible for
+    uint globalRow = gl_GlobalInvocationID.y;
+    uint globalCol = gl_GlobalInvocationID.x;
+    
+    // Local thread indices within the tile
+    uint localRow = gl_LocalInvocationID.y;
+    uint localCol = gl_LocalInvocationID.x;
+    
+    // Tile row and column (which tile this workgroup is computing)
+    uint tileRow = gl_WorkGroupID.y * TILE_M;
+    uint tileCol = gl_WorkGroupID.x * TILE_N;
+    
+    // Accumulator for this thread's output element
+    float acc = 0.0;
+    
+    // Number of K-tiles to process
+    uint numKTiles = (pc.k + TILE_K - 1u) / TILE_K;
+    
+    for (uint kTile = 0u; kTile < numKTiles; kTile++) {
+        uint kBase = kTile * TILE_K;
+        
+        // Load A tile: each thread loads one element
+        // A_shared[localRow][localCol] = A[tileRow + localRow, kBase + localCol]
+        uint aRow = tileRow + localRow;
+        uint aCol = kBase + localCol;
+        if (aRow < pc.m && aCol < pc.k) {
+            A_shared[localRow][localCol] = a[aRow * pc.k + aCol];
+        } else {
+            A_shared[localRow][localCol] = 0.0;
+        }
+        
+        // Load B tile: each thread loads one element
+        // B_shared[localRow][localCol] = B[kBase + localRow, tileCol + localCol]
+        uint bRow = kBase + localRow;
+        uint bCol = tileCol + localCol;
+        if (bRow < pc.k && bCol < pc.n) {
+            B_shared[localRow][localCol] = b[bRow * pc.n + bCol];
+        } else {
+            B_shared[localRow][localCol] = 0.0;
+        }
+        
+        // Synchronize to ensure all data is loaded
+        barrier();
+        
+        // Compute partial product for this K-tile
+        // This thread computes C[globalRow, globalCol] contribution from this tile
+        for (uint p = 0u; p < TILE_K; p++) {
+            acc = fma(A_shared[localRow][p], B_shared[p][localCol], acc);
+        }
+        
+        // Synchronize before loading next tile (to avoid race conditions)
+        barrier();
+    }
+    
+    // Write result if within bounds
+    if (globalRow < pc.m && globalCol < pc.n) {
+        c[globalRow * pc.n + globalCol] = acc;
+    }
+}

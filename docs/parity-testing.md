@@ -94,19 +94,41 @@ Floating-point results can differ between CPU and GPU due to:
 
 ### Recommended Tolerances
 
+#### F32 ops (carried from task 002)
+
 | Op Type | Tolerance | Rationale |
 |---------|-----------|-----------|
-| fill | 0.0 | Exact copy, no arithmetic |
-| axpy | 1e-4 | Single FMA per element |
-| relu | 0.0 | Exact comparison (max) |
-| gemm | 1e-3 | O(K) FMAs accumulate error |
+| `fill_f32` | 0.0 | Exact copy, no arithmetic |
+| `axpy_f32` | 1e-4 | Single FMA per element |
+| `relu_f32` | 0.0 | Exact comparison (max) |
+| `add_f32` | 1e-5 | Single addition per element |
+| `gemm_f32_naive` / `_tiled` | 1e-3 | O(K) FMAs accumulate error |
+| `conv2d_f32_nhwc` | 1e-4 relative | Accumulation depth is `K_h * K_w * C_in`; differs by accumulation order across backends |
+| `maxpool2d_f32` | 1e-5 | Selection op; only round-off boundary cases produce diff |
+| `avgpool2d_f32` | 1e-5 | Short window sums (typically 2×2 = 4 elements) |
+| `softmax_f32` | 1e-4 relative | `exp` is the dominant error term; intermediate sums in F32 |
+
+#### FP16 ops (task 003)
+
+| Op Type | Tolerance | Rationale |
+|---------|-----------|-----------|
+| `fill_fp16` | exact bit pattern on representable inputs | Deterministic round-to-nearest-even |
+| `axpy_fp16` | 1e-3 relative | F32 accumulator, FP16 round on store |
+| `relu_fp16` | exact | Pass-through; no arithmetic |
+| `add_fp16` | 1e-3 relative | Same model as axpy without the scalar |
+| `gemm_fp16` | 5e-3 relative | F32 accumulator over K terms, FP16 result; tolerance reflects mantissa precision (10 bits) |
+| `conv2d_fp16_nhwc` (CPU only) | 5e-3 relative | Same accumulation model as `gemm_fp16` |
 
 ### Scaling with Problem Size
 
 For GEMM, error grows with `K` (inner dimension):
-- K=32: ~1e-6 max error
-- K=256: ~1e-4 max error
-- K=1024: ~1e-3 max error
+- K=32: ~1e-6 max error (F32) / ~1e-3 (FP16)
+- K=256: ~1e-4 max error (F32) / ~3e-3 (FP16)
+- K=1024: ~1e-3 max error (F32) / ~5e-3 (FP16, near tolerance limit)
+
+For Conv2D, effective `K` is `K_h * K_w * C_in`:
+- 3×3 conv with C_in=64: K=576 ≈ GEMM K=512 behaviour.
+- 1×1 conv with C_in=256: K=256 ≈ same as GEMM K=256.
 
 ## Data Generation
 
@@ -129,7 +151,32 @@ let (a, b, m, n, k) = generators::gemm_test_data(0x12345);
 | fill | [-100, 100] | General range |
 | axpy | x,y: [-100, 100], α: [-10, 10] | Moderate magnitudes |
 | relu | [-100, 100] | Mix of negative/positive |
-| gemm | [-1, 1] | Small values prevent accumulation overflow |
+| add | [-10, 10] | Moderate magnitudes |
+| gemm | [-1, 1] | Small values prevent accumulation overflow at large K |
+| conv2d | input [-1, 1], weights [-0.5, 0.5] | Same accumulation budget as GEMM |
+| maxpool / avgpool | [-10, 10] | Mix of magnitudes |
+| softmax | [-5, 5] | After max-subtraction, exp inputs land in [-10, 0]; tractable |
+| FP16 variants of above | same range, narrower distribution | FP16 max ≈ 65504; we stay well clear |
+
+### End-to-end micro-graph
+
+The `dragonwing-test::micro_graph` test exercises the new ops in sequence:
+
+```
+Input 1×28×28×1
+  → Conv3×3 (1→16, stride 1, pad 1) → ReLU
+  → MaxPool 2×2 (stride 2)
+  → Conv3×3 (16→32, stride 1, pad 1) → ReLU
+  → MaxPool 2×2 (stride 2)
+  → Flatten (reshape, zero cost)
+  → GEMM (32·7·7 → 10)
+  → Softmax
+```
+
+Tolerance: `1e-4` relative for the whole pipeline. The test does not yet run
+end-to-end on Vulkan — it validates CPU multi-thread parity, deterministic
+output for a fixed seed, and that different seeds produce different output.
+Vulkan end-to-end parity is task 004 once the FP16 conv shader lands.
 
 ## Programmatic Usage
 

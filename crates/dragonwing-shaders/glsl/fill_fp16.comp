@@ -1,0 +1,43 @@
+#version 450
+//
+// fill_fp16 — write a scalar value into every element of an f16 buffer.
+//
+// Extensions required:
+//   GL_EXT_shader_16bit_storage       — for float16_t SSBO load/store
+//   GL_EXT_shader_explicit_arithmetic_types_float16 — for float16_t type
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Y[]   (write-only, float16_t)
+//
+// Push constants (16 bytes):
+//   uint  n        — element count (in f16 elements)
+//   float v        — value to write (converted to f16 on store)
+//   float _pad0    — unused
+//   float _pad1    — unused
+//
+// Dispatch:
+//   gx = ceil(n / 64). gy = gz = 1.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer YBuf {
+    float16_t y[];
+};
+
+layout(push_constant) uniform Pc {
+    uint  n;
+    float v;
+    float _pad0;
+    float _pad1;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.n) {
+        return;
+    }
+    y[gid] = float16_t(pc.v);
+}

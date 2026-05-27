@@ -1,0 +1,74 @@
+#version 450
+//
+// maxpool2d_f32 — 2D max pooling in NHWC format.
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Output[N*H_out*W_out*C]  (write-only)
+//   set=0 binding=1  std430 buffer Input[N*H_in*W_in*C]     (read-only)
+//
+// Push constants (32 bytes):
+//   uvec4 dims0: { h_in, w_in, c, n }
+//   uvec4 dims1: { pool_h, pool_w, stride_h, stride_w }
+//   uvec4 dims2: { h_out, w_out, _pad0, _pad1 }
+//   uvec4 _unused
+//
+// Dispatch:
+//   gx = ceil(w_out / 8), gy = ceil(h_out / 8), gz = n * c
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float output_data[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuf {
+    float input_data[];
+};
+
+layout(push_constant) uniform Pc {
+    uvec4 dims0;  // h_in, w_in, c, n
+    uvec4 dims1;  // pool_h, pool_w, stride_h, stride_w
+    uvec4 dims2;  // h_out, w_out, _pad0, _pad1
+    uvec4 _unused;
+} pc;
+
+void main() {
+    uint h_in = pc.dims0.x;
+    uint w_in = pc.dims0.y;
+    uint c = pc.dims0.z;
+    uint n = pc.dims0.w;
+    
+    uint pool_h = pc.dims1.x;
+    uint pool_w = pc.dims1.y;
+    uint stride_h = pc.dims1.z;
+    uint stride_w = pc.dims1.w;
+    
+    uint h_out = pc.dims2.x;
+    uint w_out = pc.dims2.y;
+    
+    // Output position
+    uint ow = gl_GlobalInvocationID.x;
+    uint oh = gl_GlobalInvocationID.y;
+    uint batch_c = gl_GlobalInvocationID.z;
+    uint batch = batch_c / c;
+    uint ch = batch_c % c;
+    
+    // Bounds check
+    if (ow >= w_out || oh >= h_out || batch >= n) {
+        return;
+    }
+    
+    float max_val = -1e38;  // Very negative value
+    
+    for (uint ph = 0u; ph < pool_h; ph++) {
+        for (uint pw = 0u; pw < pool_w; pw++) {
+            uint ih = oh * stride_h + ph;
+            uint iw = ow * stride_w + pw;
+            uint idx = ((batch * h_in + ih) * w_in + iw) * c + ch;
+            max_val = max(max_val, input_data[idx]);
+        }
+    }
+    
+    uint output_idx = ((batch * h_out + oh) * w_out + ow) * c + ch;
+    output_data[output_idx] = max_val;
+}

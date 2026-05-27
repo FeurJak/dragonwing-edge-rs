@@ -1,0 +1,100 @@
+#version 450
+//
+// softmax_f32 — Softmax along the last axis.
+//
+// This is a two-pass algorithm:
+// 1. Find max (for numerical stability)
+// 2. Compute exp(x - max) and sum, then normalize
+//
+// Each workgroup handles one row (one softmax computation).
+// Uses shared memory for reductions.
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Output[rows * n]  (write-only)
+//   set=0 binding=1  std430 buffer Input[rows * n]   (read-only)
+//
+// Push constants (16 bytes):
+//   uint n        — size of softmax dimension (last axis)
+//   uint rows     — number of rows
+//   uint _pad0
+//   uint _pad1
+//
+// Dispatch:
+//   gx = 1, gy = rows, gz = 1
+// Workgroup: 64x1x1 (each workgroup does one row)
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+shared float s_max[64];
+shared float s_sum[64];
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float output_data[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuf {
+    float input_data[];
+};
+
+layout(push_constant) uniform Pc {
+    uint n;
+    uint rows;
+    uint _pad0;
+    uint _pad1;
+} pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y;
+    
+    if (row >= pc.rows) {
+        return;
+    }
+    
+    uint row_start = row * pc.n;
+    
+    // Phase 1: Find max for numerical stability
+    // Each thread finds max of its portion
+    float local_max = -1e38;
+    for (uint i = tid; i < pc.n; i += 64u) {
+        local_max = max(local_max, input_data[row_start + i]);
+    }
+    s_max[tid] = local_max;
+    barrier();
+    
+    // Reduce to find global max
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s && tid + s < 64u) {
+            s_max[tid] = max(s_max[tid], s_max[tid + s]);
+        }
+        barrier();
+    }
+    float row_max = s_max[0];
+    barrier();
+    
+    // Phase 2: Compute exp(x - max) and sum
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.n; i += 64u) {
+        float exp_val = exp(input_data[row_start + i] - row_max);
+        output_data[row_start + i] = exp_val;  // Store temporarily
+        local_sum += exp_val;
+    }
+    s_sum[tid] = local_sum;
+    barrier();
+    
+    // Reduce to find global sum
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s && tid + s < 64u) {
+            s_sum[tid] = s_sum[tid] + s_sum[tid + s];
+        }
+        barrier();
+    }
+    float row_sum = s_sum[0];
+    float inv_sum = 1.0 / row_sum;
+    barrier();
+    
+    // Phase 3: Normalize
+    for (uint i = tid; i < pc.n; i += 64u) {
+        output_data[row_start + i] *= inv_sum;
+    }
+}

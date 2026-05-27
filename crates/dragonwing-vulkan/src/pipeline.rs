@@ -35,24 +35,54 @@ use crate::error::vk_err;
 /// Identifies a compute pipeline by op name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpKind {
+    // -----------------------------------------------------------------------
+    // F32 ops
+    // -----------------------------------------------------------------------
     /// `fill_f32.spv` — 1 SSBO (output)
     FillF32,
-    /// `axpy_f32.spv` — 2 SSBOs (x, y inout)
+    /// `axpy_f32.spv` — 2 SSBOs (y inout, x readonly)
     AxpyF32,
     /// `relu_f32.spv` — 1 SSBO (inout)
     ReluF32,
-    /// `gemm_f32.spv` — 3 SSBOs (A, B, C)
+    /// `add_f32.spv` — 3 SSBOs (y output, a readonly, b readonly)
+    AddF32,
+    /// `gemm_f32_naive.spv` — 3 SSBOs (C output, A, B), naive reference
     GemmF32,
+    /// `gemm_f32_tiled.spv` — 3 SSBOs (C output, A, B), tiled with shared memory
+    GemmF32Tiled,
+    /// `conv2d_f32_nhwc.spv` — 3 SSBOs (output, input, kernel)
+    Conv2dF32Nhwc,
+    /// `maxpool2d_f32.spv` — 2 SSBOs (output, input)
+    Maxpool2dF32,
+    /// `softmax_f32.spv` — 2 SSBOs (output, input)
+    SoftmaxF32,
+
+    // -----------------------------------------------------------------------
+    // FP16 ops
+    // -----------------------------------------------------------------------
+    /// `fill_fp16.spv` — 1 SSBO (output, F16)
+    FillFp16,
+    /// `axpy_fp16.spv` — 2 SSBOs (y inout, x readonly, F16)
+    AxpyFp16,
+    /// `relu_fp16.spv` — 1 SSBO (inout, F16)
+    ReluFp16,
+    /// `add_fp16.spv` — 3 SSBOs (y output, a readonly, b readonly, F16)
+    AddFp16,
+    /// `gemm_fp16.spv` — 3 SSBOs (C output, A, B), F16 with F32 accumulator
+    GemmFp16,
 }
 
 impl OpKind {
     /// Number of storage-buffer bindings required by this op.
     pub const fn binding_count(self) -> u32 {
         match self {
-            OpKind::FillF32 => 1,
-            OpKind::AxpyF32 => 2,
-            OpKind::ReluF32 => 1,
-            OpKind::GemmF32 => 3,
+            OpKind::FillF32 | OpKind::FillFp16 => 1,
+            OpKind::AxpyF32 | OpKind::AxpyFp16 => 2,
+            OpKind::ReluF32 | OpKind::ReluFp16 => 1,
+            OpKind::AddF32 | OpKind::AddFp16 => 3,
+            OpKind::GemmF32 | OpKind::GemmF32Tiled | OpKind::GemmFp16 => 3,
+            OpKind::Conv2dF32Nhwc => 3,
+            OpKind::Maxpool2dF32 | OpKind::SoftmaxF32 => 2,
         }
     }
 
@@ -62,21 +92,31 @@ impl OpKind {
             OpKind::FillF32 => dragonwing_shaders::FILL_F32,
             OpKind::AxpyF32 => dragonwing_shaders::AXPY_F32,
             OpKind::ReluF32 => dragonwing_shaders::RELU_F32,
+            OpKind::AddF32 => dragonwing_shaders::ADD_F32,
             OpKind::GemmF32 => dragonwing_shaders::GEMM_F32_NAIVE,
+            OpKind::GemmF32Tiled => dragonwing_shaders::GEMM_F32_TILED,
+            OpKind::Conv2dF32Nhwc => dragonwing_shaders::CONV2D_F32_NHWC,
+            OpKind::Maxpool2dF32 => dragonwing_shaders::MAXPOOL2D_F32,
+            OpKind::SoftmaxF32 => dragonwing_shaders::SOFTMAX_F32,
+            OpKind::FillFp16 => dragonwing_shaders::FILL_FP16,
+            OpKind::AxpyFp16 => dragonwing_shaders::AXPY_FP16,
+            OpKind::ReluFp16 => dragonwing_shaders::RELU_FP16,
+            OpKind::AddFp16 => dragonwing_shaders::ADD_FP16,
+            OpKind::GemmFp16 => dragonwing_shaders::GEMM_FP16,
         }
     }
 
     /// Push-constant size in bytes. Must match the shader's push_constant layout.
     pub const fn push_constant_size(self) -> u32 {
         match self {
-            // fill_f32: { n: u32, v: f32, _pad0: f32, _pad1: f32 } = 16 bytes
-            OpKind::FillF32 => 16,
-            // axpy_f32: { n: u32, alpha: f32, _pad0: f32, _pad1: f32 } = 16 bytes
-            OpKind::AxpyF32 => 16,
-            // relu_f32: { n: u32, _pad0: u32, _pad1: u32, _pad2: u32 } = 16 bytes
-            OpKind::ReluF32 => 16,
-            // gemm_f32: { M: u32, N: u32, K: u32, _pad: u32 } = 16 bytes
-            OpKind::GemmF32 => 16,
+            OpKind::FillF32 | OpKind::FillFp16 => 16,
+            OpKind::AxpyF32 | OpKind::AxpyFp16 => 16,
+            OpKind::ReluF32 | OpKind::ReluFp16 => 16,
+            OpKind::AddF32 | OpKind::AddFp16 => 16,
+            OpKind::GemmF32 | OpKind::GemmF32Tiled | OpKind::GemmFp16 => 16,
+            OpKind::SoftmaxF32 => 16,
+            // Conv2d and Maxpool have larger push constants (64 bytes)
+            OpKind::Conv2dF32Nhwc | OpKind::Maxpool2dF32 => 64,
         }
     }
 }
