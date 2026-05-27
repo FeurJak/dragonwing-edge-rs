@@ -1,0 +1,21 @@
+[package]
+name = "dragonwing-test"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Cross-backend parity testing for dragonwing-edge compute backends."
+
+[lints]
+workspace = true
+
+[dependencies]
+dragonwing-core = { path = "../dragonwing-core" }
+dragonwing-cpu = { path = "../dragonwing-cpu" }
+dragonwing-vulkan = { path = "../dragonwing-vulkan" }
+
+[[bin]]
+name = "parity-test"
+path = "src/bin/parity_test.rs"

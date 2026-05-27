@@ -1,0 +1,36 @@
+#version 450
+//
+// relu_f32 — in-place ReLU: x[i] = max(0, x[i]).
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer X[]   (read+write, in-place)
+//
+// Push constants (16 bytes):
+//   uint  n         — element count
+//   uint  _pad0
+//   uint  _pad1
+//   uint  _pad2
+//
+// Dispatch:
+//   gx = ceil(n / 64). gy = gz = 1.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer XBuf {
+    float x[];
+};
+
+layout(push_constant) uniform Pc {
+    uint  n;
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.n) {
+        return;
+    }
+    x[gid] = max(0.0, x[gid]);
+}

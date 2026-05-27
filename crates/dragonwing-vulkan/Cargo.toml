@@ -1,0 +1,41 @@
+[package]
+name = "dragonwing-vulkan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Vulkan compute backend for dragonwing-edge. Targets Adreno A702 via Mesa/Turnip."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enables `VK_LAYER_KHRONOS_validation` at instance creation. Validation
+# layers are NOT installed on the Arduino UNO Q stock image; this feature
+# is only useful for host development against SwiftShader / MoltenVK.
+validation = []
+# Enables RUST_LOG-style logging via `eprintln!` (no `log` crate dep). The
+# environment variable is read once at backend construction time.
+verbose = []
+
+[dependencies]
+# Single external runtime dep, justified at length in docs/vulkan-backend.md:
+# * `ash` is the thinnest libvulkan binding in the Rust ecosystem.
+# * `default-features = true` includes `loaded` and `debug` features which
+#   provide `Entry::load()` (dlopen of libvulkan.so.1) and `Debug` impls.
+# Transitive: `libloading` (for the dlopen call); no other transitives.
+ash = "0.38"
+
+dragonwing-core = { path = "../dragonwing-core" }
+dragonwing-shaders = { path = "../dragonwing-shaders" }
+
+[[bin]]
+name = "vulkan-test"
+path = "src/bin/vulkan_test.rs"
+
+[[bin]]
+name = "vulkan-debug"
+path = "src/bin/vulkan_debug.rs"

@@ -1,0 +1,27 @@
+[package]
+name = "dragonwing-cpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CPU reference backend for dragonwing-edge. NEON-accelerated on AArch64, scalar elsewhere."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Forwarded only; the CPU backend itself does not serialize anything.
+serde = ["dragonwing-core/serde"]
+
+[dependencies]
+# Internal only. The CPU backend has zero external dependencies on purpose:
+# it must be buildable on any host with just `cargo` and a stable rustc.
+dragonwing-core = { path = "../dragonwing-core" }
+
+[dev-dependencies]
+# Used by tests to seed deterministic input tensors. Kept out of the
+# default build to preserve the zero-runtime-deps property.
+# (Std-only rand impl, no system entropy.)
