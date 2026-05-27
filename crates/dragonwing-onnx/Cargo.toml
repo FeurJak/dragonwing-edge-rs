@@ -1,0 +1,18 @@
+[package]
+name = "dragonwing-onnx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Minimal ONNX model loader for dragonwing-edge inference framework."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+dragonwing-core = { path = "../dragonwing-core" }
