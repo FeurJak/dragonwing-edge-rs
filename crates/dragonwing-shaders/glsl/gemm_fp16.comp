@@ -1,0 +1,119 @@
+#version 450
+//
+// gemm_fp16 — C = A * B, row-major, with F16 inputs/outputs and F32 accumulator.
+//
+// This is the mixed-precision GEMM pattern: load F16 data, accumulate in F32
+// for precision, store as F16. This is critical for numerical stability when
+// K is large (K >= 256 in F16 accumulator leads to significant precision loss).
+//
+// Uses the same tiled strategy as gemm_f32_tiled with shared memory blocking.
+//
+// Extensions required:
+//   GL_EXT_shader_16bit_storage       — for float16_t SSBO load/store
+//   GL_EXT_shader_explicit_arithmetic_types_float16 — for float16_t type
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer C[m*n]   (write-only, float16_t)
+//   set=0 binding=1  std430 buffer A[m*k]   (read-only, float16_t)
+//   set=0 binding=2  std430 buffer B[k*n]   (read-only, float16_t)
+//
+// Push constants (16 bytes):
+//   uint m
+//   uint n
+//   uint k
+//   uint _pad
+//
+// Dispatch:
+//   gx = ceil(n / 16), gy = ceil(m / 16), gz = 1.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Tile dimensions
+const uint TILE_M = 16u;
+const uint TILE_N = 16u;
+const uint TILE_K = 16u;
+
+// Shared memory for tiled loading — use F32 for the accumulation tile
+// to avoid precision loss
+shared float A_shared[TILE_M][TILE_K];
+shared float B_shared[TILE_K][TILE_N];
+
+layout(set = 0, binding = 0, std430) writeonly buffer CBuf {
+    float16_t c[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer ABuf {
+    float16_t a[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer BBuf {
+    float16_t b[];
+};
+
+layout(push_constant) uniform Pc {
+    uint m;
+    uint n;
+    uint k;
+    uint _pad;
+} pc;
+
+void main() {
+    // Global row and column this thread is responsible for
+    uint globalRow = gl_GlobalInvocationID.y;
+    uint globalCol = gl_GlobalInvocationID.x;
+    
+    // Local thread indices within the tile
+    uint localRow = gl_LocalInvocationID.y;
+    uint localCol = gl_LocalInvocationID.x;
+    
+    // Tile row and column (which tile this workgroup is computing)
+    uint tileRow = gl_WorkGroupID.y * TILE_M;
+    uint tileCol = gl_WorkGroupID.x * TILE_N;
+    
+    // Accumulator for this thread's output element — F32 for precision
+    float acc = 0.0;
+    
+    // Number of K-tiles to process
+    uint numKTiles = (pc.k + TILE_K - 1u) / TILE_K;
+    
+    for (uint kTile = 0u; kTile < numKTiles; kTile++) {
+        uint kBase = kTile * TILE_K;
+        
+        // Load A tile: each thread loads one element, convert F16 -> F32
+        uint aRow = tileRow + localRow;
+        uint aCol = kBase + localCol;
+        if (aRow < pc.m && aCol < pc.k) {
+            A_shared[localRow][localCol] = float(a[aRow * pc.k + aCol]);
+        } else {
+            A_shared[localRow][localCol] = 0.0;
+        }
+        
+        // Load B tile: each thread loads one element, convert F16 -> F32
+        uint bRow = kBase + localRow;
+        uint bCol = tileCol + localCol;
+        if (bRow < pc.k && bCol < pc.n) {
+            B_shared[localRow][localCol] = float(b[bRow * pc.n + bCol]);
+        } else {
+            B_shared[localRow][localCol] = 0.0;
+        }
+        
+        // Synchronize to ensure all data is loaded
+        barrier();
+        
+        // Compute partial product for this K-tile — all math in F32
+        for (uint p = 0u; p < TILE_K; p++) {
+            acc = fma(A_shared[localRow][p], B_shared[p][localCol], acc);
+        }
+        
+        // Synchronize before loading next tile
+        barrier();
+    }
+    
+    // Write result as F16 if within bounds
+    if (globalRow < pc.m && globalCol < pc.n) {
+        c[globalRow * pc.n + globalCol] = float16_t(acc);
+    }
+}

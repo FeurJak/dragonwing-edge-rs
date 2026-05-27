@@ -1,0 +1,55 @@
+#version 450
+//
+// add_fp16 — element-wise addition: y[i] = a[i] + b[i] with F16 data.
+//
+// Extensions required:
+//   GL_EXT_shader_16bit_storage       — for float16_t SSBO load/store
+//   GL_EXT_shader_explicit_arithmetic_types_float16 — for float16_t type
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Y[]   (write-only, output, float16_t)
+//   set=0 binding=1  std430 buffer A[]   (read-only, input, float16_t)
+//   set=0 binding=2  std430 buffer B[]   (read-only, input, float16_t)
+//
+// Push constants (16 bytes):
+//   uint  n         — element count
+//   uint  _pad0
+//   uint  _pad1
+//   uint  _pad2
+//
+// Dispatch:
+//   gx = ceil(n / 64). gy = gz = 1.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer YBuf {
+    float16_t y[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer ABuf {
+    float16_t a[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer BBuf {
+    float16_t b[];
+};
+
+layout(push_constant) uniform Pc {
+    uint  n;
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.n) {
+        return;
+    }
+    // Addition can be done directly in F16 for simple cases
+    // For better precision, you could widen to F32, but for add it's usually fine
+    y[gid] = a[gid] + b[gid];
+}

@@ -28,14 +28,17 @@
 //! refused.
 
 #![cfg_attr(not(test), no_std)]
-#![forbid(unsafe_code)]
+// F16 conversion requires unsafe for NEON intrinsics and bit manipulation
+#![deny(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc;
 
 pub mod backend;
 pub mod capabilities;
+pub mod dtype;
 pub mod error;
 
 pub use backend::{Backend, BackendBuffer, BufferKind};
 pub use capabilities::HardwareCapabilities;
+pub use dtype::{Dtype, F16};
 pub use error::{Error, Result};

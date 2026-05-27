@@ -519,3 +519,739 @@ pub fn gemm_f32(
     one_shot.submit()?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// add_f32
+// ---------------------------------------------------------------------------
+
+/// Compute y[i] = a[i] + b[i] (element-wise addition).
+///
+/// All buffers must have the same size, a multiple of 4 bytes.
+///
+/// Push constants: `{ n: u32, _pad0: u32, _pad1: u32, _pad2: u32 }`.
+pub fn add_f32(
+    backend: &VulkanBackend,
+    a: &VulkanBuffer,
+    b: &VulkanBuffer,
+    y: &mut VulkanBuffer,
+) -> Result<()> {
+    if a.len_bytes() != b.len_bytes() || a.len_bytes() != y.len_bytes() {
+        return Err(Error::Backend("add_f32: buffer size mismatch".into()));
+    }
+    let n = a.len_bytes() / 4;
+    if !a.len_bytes().is_multiple_of(4) {
+        return Err(Error::Backend(
+            "add_f32: buffer size must be multiple of 4".into(),
+        ));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::AddF32)?;
+    let desc_set = backend.pipelines().allocate_descriptor_set(cached.descriptor_set_layout)?;
+
+    // Bindings: 0=Y (output), 1=A, 2=B
+    let buf_infos = [
+        vk::DescriptorBufferInfo {
+            buffer: y.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: a.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: b.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+    ];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[0..1]),
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[1..2]),
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[2..3]),
+    ];
+    unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushAdd {
+        n: u32,
+        _pad0: u32,
+        _pad1: u32,
+        _pad2: u32,
+    }
+    let pc = PushAdd {
+        n: n as u32,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+    let pc_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), std::mem::size_of::<PushAdd>()) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(
+            one_shot.cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            cached.layout,
+            0,
+            &[desc_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            one_shot.cmd,
+            cached.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            pc_bytes,
+        );
+        let groups = (n as u32).div_ceil(64);
+        device.cmd_dispatch(one_shot.cmd, groups, 1, 1);
+    }
+
+    one_shot.end()?;
+    one_shot.submit()?;
+    Ok(())
+}
+
+// ===========================================================================
+// FP16 ops
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// fill_fp16
+// ---------------------------------------------------------------------------
+
+/// Fill `dst` with `value` (F16 buffer). `dst.len_bytes()` must be a multiple of 2.
+///
+/// Push constants: `{ n: u32, value: f32 }` where `n` is element count.
+pub fn fill_fp16(backend: &VulkanBackend, dst: &mut VulkanBuffer, value: f32) -> Result<()> {
+    let n = dst.len_bytes() / 2;
+    if !dst.len_bytes().is_multiple_of(2) {
+        return Err(Error::Backend(
+            "fill_fp16: buffer size must be multiple of 2".into(),
+        ));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::FillFp16)?;
+    let desc_set = backend.pipelines().allocate_descriptor_set(cached.descriptor_set_layout)?;
+
+    let buf_info = [vk::DescriptorBufferInfo {
+        buffer: dst.vk_buffer(),
+        offset: 0,
+        range: vk::WHOLE_SIZE,
+    }];
+    let write = [vk::WriteDescriptorSet::default()
+        .dst_set(desc_set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(&buf_info)];
+    unsafe { backend.context().device().update_descriptor_sets(&write, &[]) };
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushFill {
+        n: u32,
+        value: f32,
+        _pad0: f32,
+        _pad1: f32,
+    }
+    let pc = PushFill {
+        n: n as u32,
+        value,
+        _pad0: 0.0,
+        _pad1: 0.0,
+    };
+    let pc_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), std::mem::size_of::<PushFill>()) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(
+            one_shot.cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            cached.layout,
+            0,
+            &[desc_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            one_shot.cmd,
+            cached.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            pc_bytes,
+        );
+        let groups = (n as u32).div_ceil(64);
+        device.cmd_dispatch(one_shot.cmd, groups, 1, 1);
+    }
+
+    one_shot.end()?;
+    one_shot.submit()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// axpy_fp16
+// ---------------------------------------------------------------------------
+
+/// Compute `y[i] = alpha * x[i] + y[i]` for `n` elements (F16 buffers).
+///
+/// Both buffers must have the same size, a multiple of 2 bytes.
+pub fn axpy_fp16(
+    backend: &VulkanBackend,
+    x: &VulkanBuffer,
+    y: &mut VulkanBuffer,
+    alpha: f32,
+) -> Result<()> {
+    if x.len_bytes() != y.len_bytes() {
+        return Err(Error::Backend("axpy_fp16: buffer size mismatch".into()));
+    }
+    let n = x.len_bytes() / 2;
+    if !x.len_bytes().is_multiple_of(2) {
+        return Err(Error::Backend(
+            "axpy_fp16: buffer size must be multiple of 2".into(),
+        ));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::AxpyFp16)?;
+    let desc_set = backend.pipelines().allocate_descriptor_set(cached.descriptor_set_layout)?;
+
+    let buf_infos = [
+        vk::DescriptorBufferInfo {
+            buffer: y.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: x.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+    ];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[0..1]),
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[1..2]),
+    ];
+    unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushAxpy {
+        n: u32,
+        alpha: f32,
+        _pad0: f32,
+        _pad1: f32,
+    }
+    let pc = PushAxpy {
+        n: n as u32,
+        alpha,
+        _pad0: 0.0,
+        _pad1: 0.0,
+    };
+    let pc_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), std::mem::size_of::<PushAxpy>()) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(
+            one_shot.cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            cached.layout,
+            0,
+            &[desc_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            one_shot.cmd,
+            cached.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            pc_bytes,
+        );
+        let groups = (n as u32).div_ceil(64);
+        device.cmd_dispatch(one_shot.cmd, groups, 1, 1);
+    }
+
+    one_shot.end()?;
+    one_shot.submit()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// relu_fp16
+// ---------------------------------------------------------------------------
+
+/// Apply ReLU in-place: `x[i] = max(x[i], 0)` (F16 buffer).
+pub fn relu_fp16(backend: &VulkanBackend, x: &mut VulkanBuffer) -> Result<()> {
+    let n = x.len_bytes() / 2;
+    if !x.len_bytes().is_multiple_of(2) {
+        return Err(Error::Backend(
+            "relu_fp16: buffer size must be multiple of 2".into(),
+        ));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::ReluFp16)?;
+    let desc_set = backend.pipelines().allocate_descriptor_set(cached.descriptor_set_layout)?;
+
+    let buf_info = [vk::DescriptorBufferInfo {
+        buffer: x.vk_buffer(),
+        offset: 0,
+        range: vk::WHOLE_SIZE,
+    }];
+    let write = [vk::WriteDescriptorSet::default()
+        .dst_set(desc_set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(&buf_info)];
+    unsafe { backend.context().device().update_descriptor_sets(&write, &[]) };
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushRelu {
+        n: u32,
+        _pad0: u32,
+        _pad1: u32,
+        _pad2: u32,
+    }
+    let pc = PushRelu {
+        n: n as u32,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+    let pc_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), std::mem::size_of::<PushRelu>()) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(
+            one_shot.cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            cached.layout,
+            0,
+            &[desc_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            one_shot.cmd,
+            cached.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            pc_bytes,
+        );
+        let groups = (n as u32).div_ceil(64);
+        device.cmd_dispatch(one_shot.cmd, groups, 1, 1);
+    }
+
+    one_shot.end()?;
+    one_shot.submit()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// add_fp16
+// ---------------------------------------------------------------------------
+
+/// Compute y[i] = a[i] + b[i] (element-wise addition, F16 buffers).
+///
+/// All buffers must have the same size, a multiple of 2 bytes.
+pub fn add_fp16(
+    backend: &VulkanBackend,
+    a: &VulkanBuffer,
+    b: &VulkanBuffer,
+    y: &mut VulkanBuffer,
+) -> Result<()> {
+    if a.len_bytes() != b.len_bytes() || a.len_bytes() != y.len_bytes() {
+        return Err(Error::Backend("add_fp16: buffer size mismatch".into()));
+    }
+    let n = a.len_bytes() / 2;
+    if !a.len_bytes().is_multiple_of(2) {
+        return Err(Error::Backend(
+            "add_fp16: buffer size must be multiple of 2".into(),
+        ));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::AddFp16)?;
+    let desc_set = backend.pipelines().allocate_descriptor_set(cached.descriptor_set_layout)?;
+
+    let buf_infos = [
+        vk::DescriptorBufferInfo {
+            buffer: y.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: a.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: b.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+    ];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[0..1]),
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[1..2]),
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[2..3]),
+    ];
+    unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushAdd {
+        n: u32,
+        _pad0: u32,
+        _pad1: u32,
+        _pad2: u32,
+    }
+    let pc = PushAdd {
+        n: n as u32,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+    let pc_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), std::mem::size_of::<PushAdd>()) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(
+            one_shot.cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            cached.layout,
+            0,
+            &[desc_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            one_shot.cmd,
+            cached.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            pc_bytes,
+        );
+        let groups = (n as u32).div_ceil(64);
+        device.cmd_dispatch(one_shot.cmd, groups, 1, 1);
+    }
+
+    one_shot.end()?;
+    one_shot.submit()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// gemm_f32_tiled
+// ---------------------------------------------------------------------------
+
+/// Compute C = A × B (row-major, no transpose) with tiled shared-memory blocking.
+///
+/// This is the optimized version of gemm_f32. Uses 16x16 tiles with K-blocking
+/// for improved memory locality on Adreno A702.
+///
+/// * A: M×K
+/// * B: K×N
+/// * C: M×N
+///
+/// All buffers must be sized correctly (`M*K*4`, `K*N*4`, `M*N*4`).
+///
+/// Push constants: `{ M: u32, N: u32, K: u32, _: u32 }`.
+pub fn gemm_f32_tiled(
+    backend: &VulkanBackend,
+    a: &VulkanBuffer,
+    b: &VulkanBuffer,
+    c: &mut VulkanBuffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    if a.len_bytes() != m * k * 4 {
+        return Err(Error::Backend(format!(
+            "gemm_f32_tiled: A size mismatch: expected {} got {}",
+            m * k * 4,
+            a.len_bytes()
+        )));
+    }
+    if b.len_bytes() != k * n * 4 {
+        return Err(Error::Backend(format!(
+            "gemm_f32_tiled: B size mismatch: expected {} got {}",
+            k * n * 4,
+            b.len_bytes()
+        )));
+    }
+    if c.len_bytes() != m * n * 4 {
+        return Err(Error::Backend(format!(
+            "gemm_f32_tiled: C size mismatch: expected {} got {}",
+            m * n * 4,
+            c.len_bytes()
+        )));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::GemmF32Tiled)?;
+    let desc_set = backend.pipelines().allocate_descriptor_set(cached.descriptor_set_layout)?;
+
+    let buf_infos = [
+        vk::DescriptorBufferInfo {
+            buffer: c.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: a.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: b.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+    ];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[0..1]),
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[1..2]),
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[2..3]),
+    ];
+    unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushGemm {
+        m: u32,
+        n: u32,
+        k: u32,
+        _pad: u32,
+    }
+    let pc = PushGemm {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+        _pad: 0,
+    };
+    let pc_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), std::mem::size_of::<PushGemm>()) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(
+            one_shot.cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            cached.layout,
+            0,
+            &[desc_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            one_shot.cmd,
+            cached.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            pc_bytes,
+        );
+        let groups_x = (n as u32).div_ceil(16);
+        let groups_y = (m as u32).div_ceil(16);
+        device.cmd_dispatch(one_shot.cmd, groups_x, groups_y, 1);
+    }
+
+    one_shot.end()?;
+    one_shot.submit()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// gemm_fp16
+// ---------------------------------------------------------------------------
+
+/// Compute C = A × B (row-major, no transpose) with F16 buffers.
+///
+/// Uses F32 accumulator internally for precision (mixed-precision pattern).
+///
+/// * A: M×K (F16)
+/// * B: K×N (F16)
+/// * C: M×N (F16)
+///
+/// All buffers must be sized correctly (`M*K*2`, `K*N*2`, `M*N*2`).
+///
+/// Push constants: `{ M: u32, N: u32, K: u32, _: u32 }`.
+pub fn gemm_fp16(
+    backend: &VulkanBackend,
+    a: &VulkanBuffer,
+    b: &VulkanBuffer,
+    c: &mut VulkanBuffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    if a.len_bytes() != m * k * 2 {
+        return Err(Error::Backend(format!(
+            "gemm_fp16: A size mismatch: expected {} got {}",
+            m * k * 2,
+            a.len_bytes()
+        )));
+    }
+    if b.len_bytes() != k * n * 2 {
+        return Err(Error::Backend(format!(
+            "gemm_fp16: B size mismatch: expected {} got {}",
+            k * n * 2,
+            b.len_bytes()
+        )));
+    }
+    if c.len_bytes() != m * n * 2 {
+        return Err(Error::Backend(format!(
+            "gemm_fp16: C size mismatch: expected {} got {}",
+            m * n * 2,
+            c.len_bytes()
+        )));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::GemmFp16)?;
+    let desc_set = backend.pipelines().allocate_descriptor_set(cached.descriptor_set_layout)?;
+
+    let buf_infos = [
+        vk::DescriptorBufferInfo {
+            buffer: c.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: a.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: b.vk_buffer(),
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        },
+    ];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[0..1]),
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[1..2]),
+        vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_infos[2..3]),
+    ];
+    unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushGemm {
+        m: u32,
+        n: u32,
+        k: u32,
+        _pad: u32,
+    }
+    let pc = PushGemm {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+        _pad: 0,
+    };
+    let pc_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), std::mem::size_of::<PushGemm>()) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(
+            one_shot.cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            cached.layout,
+            0,
+            &[desc_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            one_shot.cmd,
+            cached.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            pc_bytes,
+        );
+        let groups_x = (n as u32).div_ceil(16);
+        let groups_y = (m as u32).div_ceil(16);
+        device.cmd_dispatch(one_shot.cmd, groups_x, groups_y, 1);
+    }
+
+    one_shot.end()?;
+    one_shot.submit()?;
+    Ok(())
+}

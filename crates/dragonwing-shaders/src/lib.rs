@@ -35,6 +35,10 @@
 #![no_std]
 #![warn(missing_docs)]
 
+// ===========================================================================
+// F32 shaders
+// ===========================================================================
+
 /// `fill_f32` — write a scalar to every element of an f32 buffer.
 ///
 /// Push-constant layout: `{ uint n; float v; float _; float _; }`.
@@ -49,9 +53,15 @@ pub const AXPY_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/axpy_f32.s
 
 /// `relu_f32` — `y[i] = max(0, x[i])`.
 ///
-/// Push-constant layout: `{ uint n; float _; float _; float _; }`.
+/// Push-constant layout: `{ uint n; uint _; uint _; uint _; }`.
 /// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
 pub const RELU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/relu_f32.spv"));
+
+/// `add_f32` — `y[i] = a[i] + b[i]`.
+///
+/// Push-constant layout: `{ uint n; uint _; uint _; uint _; }`.
+/// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
+pub const ADD_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_f32.spv"));
 
 /// `gemm_f32_naive` — `C = A * B`, row-major, naive triple-loop with
 /// fma() inner.
@@ -61,13 +71,64 @@ pub const RELU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/relu_f32.s
 pub const GEMM_F32_NAIVE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_f32_naive.spv"));
 
+/// `gemm_f32_tiled` — `C = A * B`, row-major, tiled with shared memory.
+/// Uses 16x16 tiles with K-blocking for improved memory locality.
+///
+/// Push-constant layout: `{ uint m; uint n; uint k; uint _; }`.
+/// Dispatch: `gx = ceil(n / 16), gy = ceil(m / 16), gz = 1`.
+pub const GEMM_F32_TILED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_f32_tiled.spv"));
+
+/// `gemm_fp16` — `C = A * B`, row-major, F16 inputs/outputs with F32
+/// accumulator for precision.
+///
+/// Push-constant layout: `{ uint m; uint n; uint k; uint _; }`.
+/// Dispatch: `gx = ceil(n / 16), gy = ceil(m / 16), gz = 1`.
+pub const GEMM_FP16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_fp16.spv"));
+
+// ===========================================================================
+// FP16 shaders (require VK_KHR_16bit_storage + shaderFloat16)
+// ===========================================================================
+
+/// `fill_fp16` — write a scalar to every element of an f16 buffer.
+///
+/// Push-constant layout: `{ uint n; float v; float _; float _; }`.
+/// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
+pub const FILL_FP16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fill_fp16.spv"));
+
+/// `axpy_fp16` — `y[i] = a * x[i] + y[i]` with F16 buffers.
+/// Computes in F32 internally for precision.
+///
+/// Push-constant layout: `{ uint n; float a; float _; float _; }`.
+/// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
+pub const AXPY_FP16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/axpy_fp16.spv"));
+
+/// `relu_fp16` — `y[i] = max(0, x[i])` with F16 buffers.
+///
+/// Push-constant layout: `{ uint n; uint _; uint _; uint _; }`.
+/// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
+pub const RELU_FP16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/relu_fp16.spv"));
+
+/// `add_fp16` — `y[i] = a[i] + b[i]` with F16 buffers.
+///
+/// Push-constant layout: `{ uint n; uint _; uint _; uint _; }`.
+/// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
+pub const ADD_FP16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_fp16.spv"));
+
 /// Convenience: every shader byte-slice in the crate, indexed by a
 /// stable string id. Useful for a `--list-shaders` developer tool.
 pub const ALL: &[(&str, &[u8])] = &[
     ("fill_f32", FILL_F32),
     ("axpy_f32", AXPY_F32),
     ("relu_f32", RELU_F32),
+    ("add_f32", ADD_F32),
     ("gemm_f32_naive", GEMM_F32_NAIVE),
+    ("gemm_f32_tiled", GEMM_F32_TILED),
+    ("fill_fp16", FILL_FP16),
+    ("axpy_fp16", AXPY_FP16),
+    ("relu_fp16", RELU_FP16),
+    ("add_fp16", ADD_FP16),
+    ("gemm_fp16", GEMM_FP16),
 ];
 
 #[cfg(test)]
