@@ -61,6 +61,14 @@ pub enum OpKind {
     SoftmaxF32,
 
     // -----------------------------------------------------------------------
+    // YOLO F32 ops (Task 005)
+    // -----------------------------------------------------------------------
+    /// `sigmoid_f32.spv` — 2 SSBOs (output, input)
+    SigmoidF32,
+    /// `mul_f32.spv` — 3 SSBOs (y output, a readonly, b readonly)
+    MulF32,
+
+    // -----------------------------------------------------------------------
     // FP16 ops
     // -----------------------------------------------------------------------
     /// `fill_fp16.spv` — 1 SSBO (output, F16)
@@ -86,6 +94,9 @@ impl OpKind {
             OpKind::GemmF32 | OpKind::GemmF32Tiled | OpKind::GemmFp16 => 3,
             OpKind::Conv2dF32Nhwc | OpKind::Conv2dFp16Nhwc => 3,
             OpKind::Maxpool2dF32 | OpKind::SoftmaxF32 => 2,
+            // YOLO ops
+            OpKind::SigmoidF32 => 2,
+            OpKind::MulF32 => 3,
         }
     }
 
@@ -107,6 +118,9 @@ impl OpKind {
             OpKind::ReluFp16 => dragonwing_shaders::RELU_FP16,
             OpKind::AddFp16 => dragonwing_shaders::ADD_FP16,
             OpKind::GemmFp16 => dragonwing_shaders::GEMM_FP16,
+            // YOLO ops
+            OpKind::SigmoidF32 => dragonwing_shaders::SIGMOID_F32,
+            OpKind::MulF32 => dragonwing_shaders::MUL_F32,
         }
     }
 
@@ -121,6 +135,8 @@ impl OpKind {
             OpKind::SoftmaxF32 => 16,
             // Conv2d and Maxpool have larger push constants (64 bytes)
             OpKind::Conv2dF32Nhwc | OpKind::Conv2dFp16Nhwc | OpKind::Maxpool2dF32 => 64,
+            // YOLO ops
+            OpKind::SigmoidF32 | OpKind::MulF32 => 16,
         }
     }
 }

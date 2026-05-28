@@ -138,6 +138,33 @@ Floating-point results can differ between CPU and GPU due to:
 | CPU F16 vs reference | 5e-2 relative | Wider tolerance for FP16 accumulation |
 | Vulkan F32 vs CPU F32 | 1e-3 relative | (Task 005 — not yet tested) |
 
+#### Task 005 ops (YOLO)
+
+| Op Type | Tolerance | Rationale |
+|---------|-----------|-----------|
+| `sigmoid_f32` | 1e-5 | exp() precision dominates |
+| `sigmoid_fp16` | 1e-3 | F32 compute, FP16 store |
+| `mul_f32` | 1e-6 | Single multiply per element |
+| `mul_fp16` | 1e-3 | Same as add_fp16 |
+| `sub_f32` | 1e-6 | Single subtract per element |
+| `div_f32` | 1e-5 | Division precision |
+| `concat_f32` | 0.0 | Pure memory copy |
+| `resize_nearest_f32` | 0.0 | Index lookup only |
+| `resize_bilinear_f32` | 1e-5 | Linear interpolation |
+| `split_f32` | 0.0 | Pure memory copy |
+| `transpose_f32` | 0.0 | Index remapping |
+| `slice_f32` | 0.0 | Subview extraction |
+| `silu_f32` (fused) | 1e-5 | Sigmoid + multiply |
+
+#### End-to-end YOLO
+
+| Comparison | Tolerance | Notes |
+|------------|-----------|-------|
+| Detection bbox | 1.0 pixel | Absolute bbox coordinate tolerance |
+| Detection confidence | 1e-3 | Relative confidence tolerance |
+| Detection count | exact | Must find same number of detections |
+| NMS output | order-independent | Sort by confidence before comparing |
+
 ### Scaling with Problem Size
 
 For GEMM, error grows with `K` (inner dimension):
@@ -178,6 +205,11 @@ let (a, b, m, n, k) = generators::gemm_test_data(0x12345);
 | depthwise conv | input [-1, 1], weights [-0.5, 0.5] | Same as standard conv (K=9 for 3×3) |
 | global_avg_pool | [-10, 10] | Sum over spatial dims |
 | relu6 / clip | [-10, 10] | Mix of values inside and outside [0, 6] |
+| sigmoid | [-5, 5] | Avoids saturation at extreme values |
+| mul / sub / div | [-10, 10] | Moderate magnitudes |
+| concat / split / transpose | [-100, 100] | Pure memory ops, range doesn't matter |
+| resize | [0, 1] | Normalized image values |
+| silu | [-5, 5] | Same as sigmoid (contains sigmoid) |
 | FP16 variants of above | same range, narrower distribution | FP16 max ≈ 65504; we stay well clear |
 
 ### End-to-end micro-graph

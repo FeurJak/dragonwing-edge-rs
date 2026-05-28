@@ -73,6 +73,7 @@ version = "0.0.1"
 dependencies = [
  "dragonwing-core",
  "dragonwing-cpu",
+ "dragonwing-onnx",
  "dragonwing-vulkan",
 ]
 

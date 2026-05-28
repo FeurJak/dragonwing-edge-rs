@@ -34,6 +34,11 @@
 pub mod harness;
 pub mod generators;
 pub mod micro_graph;
+pub mod yolo_e2e;
 
 pub use harness::{ParityTest, TestConfig, TestResult, TestResults};
 pub use micro_graph::{run_cpu, run_cpu_mt, compare_results, MicroGraphResult};
+pub use yolo_e2e::{
+    create_mini_yolo_graph, create_synthetic_yolo_output,
+    test_yolo_postprocess, test_fusion_detection, test_fusion_pass,
+};

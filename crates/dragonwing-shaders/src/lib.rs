@@ -119,6 +119,22 @@ pub const MAXPOOL2D_F32: &[u8] =
 pub const SOFTMAX_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/softmax_f32.spv"));
 
 // ===========================================================================
+// YOLO ops (Task 005)
+// ===========================================================================
+
+/// `sigmoid_f32` — element-wise sigmoid: y[i] = 1/(1+exp(-x[i])).
+///
+/// Push-constant layout: `{ uint n; uint _; uint _; uint _; }`.
+/// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
+pub const SIGMOID_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_f32.spv"));
+
+/// `mul_f32` — element-wise multiplication: y[i] = a[i] * b[i].
+///
+/// Push-constant layout: `{ uint n; uint _; uint _; uint _; }`.
+/// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
+pub const MUL_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_f32.spv"));
+
+// ===========================================================================
 // FP16 shaders (require VK_KHR_16bit_storage + shaderFloat16)
 // ===========================================================================
 
@@ -160,6 +176,8 @@ pub const ALL: &[(&str, &[u8])] = &[
     ("conv2d_fp16_nhwc", CONV2D_FP16_NHWC),
     ("maxpool2d_f32", MAXPOOL2D_F32),
     ("softmax_f32", SOFTMAX_F32),
+    ("sigmoid_f32", SIGMOID_F32),
+    ("mul_f32", MUL_F32),
     ("fill_fp16", FILL_FP16),
     ("axpy_fp16", AXPY_FP16),
     ("relu_fp16", RELU_FP16),

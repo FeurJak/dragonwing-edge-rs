@@ -852,6 +852,256 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // YOLO ops tests (Task 005)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sigmoid_f32_basic() {
+        let x = vec![-2.0f32, -1.0, 0.0, 1.0, 2.0];
+        let mut y = vec![0.0f32; 5];
+        
+        super::sigmoid_f32(&mut y, &x);
+        
+        // sigmoid(-2) ≈ 0.119, sigmoid(-1) ≈ 0.269, sigmoid(0) = 0.5
+        // sigmoid(1) ≈ 0.731, sigmoid(2) ≈ 0.881
+        let expected = [0.119, 0.269, 0.5, 0.731, 0.881];
+        for (i, (&out, &exp)) in y.iter().zip(expected.iter()).enumerate() {
+            let diff = (out - exp).abs();
+            assert!(diff < 0.01, "sigmoid mismatch at {i}: {out} vs {exp}");
+        }
+    }
+
+    #[test]
+    fn sigmoid_f32_matches_scalar() {
+        let x: Vec<f32> = (-50..50).map(|i| i as f32 * 0.1).collect();
+        let mut y_main = vec![0.0f32; x.len()];
+        let mut y_scalar = vec![0.0f32; x.len()];
+        
+        super::sigmoid_f32(&mut y_main, &x);
+        super::sigmoid_f32_scalar(&mut y_scalar, &x);
+        
+        for (i, (&a, &b)) in y_main.iter().zip(y_scalar.iter()).enumerate() {
+            assert!(approx_eq(a, b), "sigmoid mismatch at {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn mul_f32_basic() {
+        let a: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..100).map(|i| i as f32 * 0.5).collect();
+        let mut y = vec![0.0f32; 100];
+        
+        super::mul_f32(&mut y, &a, &b);
+        
+        for i in 0..100 {
+            let expected = a[i] * b[i];
+            assert_eq!(y[i], expected, "mul_f32 mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn mul_f32_matches_scalar() {
+        let a: Vec<f32> = (0..67).map(|i| i as f32 * 1.5).collect();
+        let b: Vec<f32> = (0..67).map(|i| (i as f32).sin()).collect();
+        let mut y_main = vec![0.0f32; 67];
+        let mut y_scalar = vec![0.0f32; 67];
+        
+        super::mul_f32(&mut y_main, &a, &b);
+        super::mul_f32_scalar(&mut y_scalar, &a, &b);
+        
+        for (i, (&a, &b)) in y_main.iter().zip(y_scalar.iter()).enumerate() {
+            assert!(approx_eq(a, b), "mul_f32 mismatch at {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn concat_f32_channels() {
+        // Concat two [1,2,2,2] tensors along channel axis -> [1,2,2,4]
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]; // [1,2,2,2]
+        let b = vec![10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]; // [1,2,2,2]
+        let mut output = vec![0.0f32; 16]; // [1,2,2,4]
+        
+        super::concat_f32(
+            &mut output,
+            &[&a[..], &b[..]],
+            &[[1, 2, 2, 2], [1, 2, 2, 2]],
+            3
+        );
+        
+        // At each spatial position, channels from a then b
+        // (0,0): [1,2] + [10,20] = [1,2,10,20]
+        // (0,1): [3,4] + [30,40] = [3,4,30,40]
+        // etc.
+        let expected = [
+            1.0, 2.0, 10.0, 20.0,  // (0,0,0)
+            3.0, 4.0, 30.0, 40.0,  // (0,0,1)
+            5.0, 6.0, 50.0, 60.0,  // (0,1,0)
+            7.0, 8.0, 70.0, 80.0,  // (0,1,1)
+        ];
+        assert_eq!(output, expected, "concat along channels failed");
+    }
+
+    #[test]
+    fn concat_f32_batch() {
+        // Concat two [1,2,2,1] tensors along batch axis -> [2,2,2,1]
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b = vec![5.0f32, 6.0, 7.0, 8.0];
+        let mut output = vec![0.0f32; 8];
+        
+        super::concat_f32(
+            &mut output,
+            &[&a[..], &b[..]],
+            &[[1, 2, 2, 1], [1, 2, 2, 1]],
+            0
+        );
+        
+        let expected = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        assert_eq!(output, expected, "concat along batch failed");
+    }
+
+    #[test]
+    fn resize_f32_nearest_2x() {
+        // Upsample [1,2,2,1] to [1,4,4,1] with nearest neighbor
+        let input = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut output = vec![0.0f32; 16];
+        
+        super::resize_f32(&mut output, &input, 1, 2, 2, 4, 4, 1, super::ResizeMode::Nearest);
+        
+        // Each input pixel becomes a 2x2 block
+        // Input: [1,2; 3,4] -> Output: [1,1,2,2; 1,1,2,2; 3,3,4,4; 3,3,4,4]
+        let expected = [
+            1.0, 1.0, 2.0, 2.0,
+            1.0, 1.0, 2.0, 2.0,
+            3.0, 3.0, 4.0, 4.0,
+            3.0, 3.0, 4.0, 4.0,
+        ];
+        for (i, (&out, &exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (out - exp).abs();
+            assert!(diff < 0.1, "resize nearest mismatch at {i}: {out} vs {exp}");
+        }
+    }
+
+    #[test]
+    fn resize_f32_bilinear_2x() {
+        // Upsample [1,2,2,1] to [1,4,4,1] with bilinear
+        let input = vec![0.0f32, 1.0, 2.0, 3.0];
+        let mut output = vec![0.0f32; 16];
+        
+        super::resize_f32(&mut output, &input, 1, 2, 2, 4, 4, 1, super::ResizeMode::Bilinear);
+        
+        // Bilinear interpolation should produce smooth gradients
+        // The exact values depend on the coordinate mapping convention
+        // Just verify the output has reasonable interpolated values
+        let min_val: f32 = *output.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+        let max_val: f32 = *output.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+        
+        // Values should be within input range (0-3) with some margin for edge handling
+        assert!(min_val >= -0.5, "min should be near 0, got {min_val}");
+        assert!(max_val <= 3.5, "max should be near 3, got {max_val}");
+        
+        // Output should vary smoothly - check that there's a gradient
+        assert!(output[15] > output[0], "should have gradient from top-left to bottom-right");
+    }
+
+    #[test]
+    fn split_f32_channels() {
+        // Split [1,2,2,4] into two [1,2,2,2] along channels
+        let input: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let mut out1 = vec![0.0f32; 8];
+        let mut out2 = vec![0.0f32; 8];
+        
+        super::split_f32(
+            &mut [&mut out1[..], &mut out2[..]],
+            &input,
+            [1, 2, 2, 4],
+            3,
+            &[2, 2]
+        );
+        
+        // First output gets channels 0-1, second gets channels 2-3
+        // Input at (0,0): [0,1,2,3] -> out1[0,0]=[0,1], out2[0,0]=[2,3]
+        assert_eq!(out1[0], 0.0);
+        assert_eq!(out1[1], 1.0);
+        assert_eq!(out2[0], 2.0);
+        assert_eq!(out2[1], 3.0);
+    }
+
+    #[test]
+    fn transpose_f32_nchw_to_nhwc() {
+        // Transpose [1,2,3,4] (NCHW) to [1,3,4,2] (NHWC)
+        // This is a common operation when converting between formats
+        let input: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let mut output = vec![0.0f32; 24];
+        
+        super::transpose_f32(&mut output, &input, [1, 2, 3, 4], [0, 2, 3, 1]);
+        
+        // Original: input[n,c,h,w] at index n*24 + c*12 + h*4 + w
+        // Output: output[n,h,w,c] at index n*24 + h*8 + w*2 + c
+        // input[0,0,0,0] = 0 -> output[0,0,0,0] = 0
+        // input[0,1,0,0] = 12 -> output[0,0,0,1] = 1st output position channel 1
+        assert_eq!(output[0], 0.0);  // [0,0,0,0]
+        assert_eq!(output[1], 12.0); // [0,0,0,1] = input[0,1,0,0]
+    }
+
+    #[test]
+    fn sub_f32_basic() {
+        let a: Vec<f32> = (0..100).map(|i| i as f32 * 2.0).collect();
+        let b: Vec<f32> = (0..100).map(|i| i as f32 * 0.5).collect();
+        let mut y = vec![0.0f32; 100];
+        
+        super::sub_f32(&mut y, &a, &b);
+        
+        for i in 0..100 {
+            let expected = a[i] - b[i];
+            assert_eq!(y[i], expected, "sub_f32 mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn sub_f32_matches_scalar() {
+        let a: Vec<f32> = (0..67).map(|i| i as f32 * 1.5).collect();
+        let b: Vec<f32> = (0..67).map(|i| (i as f32).sin()).collect();
+        let mut y_main = vec![0.0f32; 67];
+        let mut y_scalar = vec![0.0f32; 67];
+        
+        super::sub_f32(&mut y_main, &a, &b);
+        super::sub_f32_scalar(&mut y_scalar, &a, &b);
+        
+        for (i, (&a, &b)) in y_main.iter().zip(y_scalar.iter()).enumerate() {
+            assert!(approx_eq(a, b), "sub_f32 mismatch at {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn div_f32_basic() {
+        let a: Vec<f32> = (1..101).map(|i| i as f32 * 2.0).collect();
+        let b: Vec<f32> = (1..101).map(|i| i as f32 * 0.5).collect();
+        let mut y = vec![0.0f32; 100];
+        
+        super::div_f32(&mut y, &a, &b);
+        
+        for i in 0..100 {
+            let expected = a[i] / b[i];
+            assert!(approx_eq(y[i], expected), "div_f32 mismatch at {i}: {} vs {}", y[i], expected);
+        }
+    }
+
+    #[test]
+    fn div_f32_matches_scalar() {
+        let a: Vec<f32> = (1..68).map(|i| i as f32 * 1.5).collect();
+        let b: Vec<f32> = (1..68).map(|i| (i as f32).sin().abs() + 0.1).collect(); // Avoid division by zero
+        let mut y_main = vec![0.0f32; 67];
+        let mut y_scalar = vec![0.0f32; 67];
+        
+        super::div_f32(&mut y_main, &a, &b);
+        super::div_f32_scalar(&mut y_scalar, &a, &b);
+        
+        for (i, (&a, &b)) in y_main.iter().zip(y_scalar.iter()).enumerate() {
+            assert!(approx_eq(a, b), "div_f32 mismatch at {i}: {a} vs {b}");
+        }
+    }
 }
 
 // ===========================================================================
@@ -1366,6 +1616,737 @@ pub fn conv2d_f32_nhwc_mt(
             }
         }
     });
+}
+
+// ===========================================================================
+// YOLO Ops (Task 005)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// sigmoid: y[i] = 1 / (1 + exp(-x[i]))
+// ---------------------------------------------------------------------------
+
+/// Element-wise sigmoid: `y[i] = 1 / (1 + exp(-x[i]))`.
+///
+/// # Panics
+///
+/// Panics if `y.len() != x.len()`.
+pub fn sigmoid_f32(y: &mut [f32], x: &[f32]) {
+    assert_eq!(y.len(), x.len(), "sigmoid_f32: length mismatch");
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { sigmoid_f32_neon(y, x) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        sigmoid_f32_scalar(y, x);
+    }
+}
+
+/// Portable scalar implementation of [`sigmoid_f32`].
+pub fn sigmoid_f32_scalar(y: &mut [f32], x: &[f32]) {
+    assert_eq!(y.len(), x.len(), "sigmoid_f32_scalar: length mismatch");
+    for (yi, xi) in y.iter_mut().zip(x.iter()) {
+        *yi = 1.0 / (1.0 + (-*xi).exp());
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sigmoid_f32_neon(y: &mut [f32], x: &[f32]) {
+    // NEON doesn't have a direct exp intrinsic, so we fall back to scalar
+    // For production, consider using a polynomial approximation
+    sigmoid_f32_scalar(y, x);
+}
+
+/// FP16 sigmoid with F32 compute.
+pub fn sigmoid_fp16(y: &mut [F16], x: &[F16]) {
+    assert_eq!(y.len(), x.len(), "sigmoid_fp16: length mismatch");
+    for (yi, xi) in y.iter_mut().zip(x.iter()) {
+        let xf = xi.to_f32();
+        let result = 1.0 / (1.0 + (-xf).exp());
+        *yi = F16::from_f32(result);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mul: y[i] = a[i] * b[i]
+// ---------------------------------------------------------------------------
+
+/// Element-wise multiplication: `y[i] = a[i] * b[i]`.
+///
+/// # Panics
+///
+/// Panics if lengths don't match.
+pub fn mul_f32(y: &mut [f32], a: &[f32], b: &[f32]) {
+    assert_eq!(y.len(), a.len(), "mul_f32: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "mul_f32: y/b length mismatch");
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { mul_f32_neon(y, a, b) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        mul_f32_scalar(y, a, b);
+    }
+}
+
+/// Portable scalar implementation of [`mul_f32`].
+pub fn mul_f32_scalar(y: &mut [f32], a: &[f32], b: &[f32]) {
+    assert_eq!(y.len(), a.len(), "mul_f32_scalar: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "mul_f32_scalar: y/b length mismatch");
+    for i in 0..y.len() {
+        y[i] = a[i] * b[i];
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn mul_f32_neon(y: &mut [f32], a: &[f32], b: &[f32]) {
+    use core::arch::aarch64::{vmulq_f32, vld1q_f32, vst1q_f32};
+    debug_assert_eq!(y.len(), a.len());
+    debug_assert_eq!(y.len(), b.len());
+    let len = y.len();
+    unsafe {
+        let mut i = 0;
+        while i + 16 <= len {
+            let py = y.as_mut_ptr().add(i);
+            let pa = a.as_ptr().add(i);
+            let pb = b.as_ptr().add(i);
+
+            let a0 = vld1q_f32(pa);
+            let a1 = vld1q_f32(pa.add(4));
+            let a2 = vld1q_f32(pa.add(8));
+            let a3 = vld1q_f32(pa.add(12));
+
+            let b0 = vld1q_f32(pb);
+            let b1 = vld1q_f32(pb.add(4));
+            let b2 = vld1q_f32(pb.add(8));
+            let b3 = vld1q_f32(pb.add(12));
+
+            vst1q_f32(py, vmulq_f32(a0, b0));
+            vst1q_f32(py.add(4), vmulq_f32(a1, b1));
+            vst1q_f32(py.add(8), vmulq_f32(a2, b2));
+            vst1q_f32(py.add(12), vmulq_f32(a3, b3));
+            i += 16;
+        }
+        while i < len {
+            *y.get_unchecked_mut(i) = *a.get_unchecked(i) * *b.get_unchecked(i);
+            i += 1;
+        }
+    }
+}
+
+/// FP16 element-wise multiplication.
+pub fn mul_fp16(y: &mut [F16], a: &[F16], b: &[F16]) {
+    assert_eq!(y.len(), a.len(), "mul_fp16: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "mul_fp16: y/b length mismatch");
+    for i in 0..y.len() {
+        let a_f32 = a[i].to_f32();
+        let b_f32 = b[i].to_f32();
+        y[i] = F16::from_f32(a_f32 * b_f32);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sub: y[i] = a[i] - b[i]
+// ---------------------------------------------------------------------------
+
+/// Element-wise subtraction: `y[i] = a[i] - b[i]`.
+///
+/// # Panics
+///
+/// Panics if lengths don't match.
+pub fn sub_f32(y: &mut [f32], a: &[f32], b: &[f32]) {
+    assert_eq!(y.len(), a.len(), "sub_f32: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "sub_f32: y/b length mismatch");
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { sub_f32_neon(y, a, b) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        sub_f32_scalar(y, a, b);
+    }
+}
+
+/// Portable scalar implementation of [`sub_f32`].
+pub fn sub_f32_scalar(y: &mut [f32], a: &[f32], b: &[f32]) {
+    assert_eq!(y.len(), a.len(), "sub_f32_scalar: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "sub_f32_scalar: y/b length mismatch");
+    for i in 0..y.len() {
+        y[i] = a[i] - b[i];
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sub_f32_neon(y: &mut [f32], a: &[f32], b: &[f32]) {
+    use core::arch::aarch64::{vsubq_f32, vld1q_f32, vst1q_f32};
+    debug_assert_eq!(y.len(), a.len());
+    debug_assert_eq!(y.len(), b.len());
+    let len = y.len();
+    unsafe {
+        let mut i = 0;
+        while i + 16 <= len {
+            let py = y.as_mut_ptr().add(i);
+            let pa = a.as_ptr().add(i);
+            let pb = b.as_ptr().add(i);
+
+            let a0 = vld1q_f32(pa);
+            let a1 = vld1q_f32(pa.add(4));
+            let a2 = vld1q_f32(pa.add(8));
+            let a3 = vld1q_f32(pa.add(12));
+
+            let b0 = vld1q_f32(pb);
+            let b1 = vld1q_f32(pb.add(4));
+            let b2 = vld1q_f32(pb.add(8));
+            let b3 = vld1q_f32(pb.add(12));
+
+            vst1q_f32(py, vsubq_f32(a0, b0));
+            vst1q_f32(py.add(4), vsubq_f32(a1, b1));
+            vst1q_f32(py.add(8), vsubq_f32(a2, b2));
+            vst1q_f32(py.add(12), vsubq_f32(a3, b3));
+            i += 16;
+        }
+        while i < len {
+            *y.get_unchecked_mut(i) = *a.get_unchecked(i) - *b.get_unchecked(i);
+            i += 1;
+        }
+    }
+}
+
+/// FP16 element-wise subtraction.
+pub fn sub_fp16(y: &mut [F16], a: &[F16], b: &[F16]) {
+    assert_eq!(y.len(), a.len(), "sub_fp16: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "sub_fp16: y/b length mismatch");
+    for i in 0..y.len() {
+        let a_f32 = a[i].to_f32();
+        let b_f32 = b[i].to_f32();
+        y[i] = F16::from_f32(a_f32 - b_f32);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// div: y[i] = a[i] / b[i]
+// ---------------------------------------------------------------------------
+
+/// Element-wise division: `y[i] = a[i] / b[i]`.
+///
+/// # Panics
+///
+/// Panics if lengths don't match.
+pub fn div_f32(y: &mut [f32], a: &[f32], b: &[f32]) {
+    assert_eq!(y.len(), a.len(), "div_f32: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "div_f32: y/b length mismatch");
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { div_f32_neon(y, a, b) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        div_f32_scalar(y, a, b);
+    }
+}
+
+/// Portable scalar implementation of [`div_f32`].
+pub fn div_f32_scalar(y: &mut [f32], a: &[f32], b: &[f32]) {
+    assert_eq!(y.len(), a.len(), "div_f32_scalar: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "div_f32_scalar: y/b length mismatch");
+    for i in 0..y.len() {
+        y[i] = a[i] / b[i];
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn div_f32_neon(y: &mut [f32], a: &[f32], b: &[f32]) {
+    use core::arch::aarch64::{vdivq_f32, vld1q_f32, vst1q_f32};
+    debug_assert_eq!(y.len(), a.len());
+    debug_assert_eq!(y.len(), b.len());
+    let len = y.len();
+    unsafe {
+        let mut i = 0;
+        while i + 16 <= len {
+            let py = y.as_mut_ptr().add(i);
+            let pa = a.as_ptr().add(i);
+            let pb = b.as_ptr().add(i);
+
+            let a0 = vld1q_f32(pa);
+            let a1 = vld1q_f32(pa.add(4));
+            let a2 = vld1q_f32(pa.add(8));
+            let a3 = vld1q_f32(pa.add(12));
+
+            let b0 = vld1q_f32(pb);
+            let b1 = vld1q_f32(pb.add(4));
+            let b2 = vld1q_f32(pb.add(8));
+            let b3 = vld1q_f32(pb.add(12));
+
+            vst1q_f32(py, vdivq_f32(a0, b0));
+            vst1q_f32(py.add(4), vdivq_f32(a1, b1));
+            vst1q_f32(py.add(8), vdivq_f32(a2, b2));
+            vst1q_f32(py.add(12), vdivq_f32(a3, b3));
+            i += 16;
+        }
+        while i < len {
+            *y.get_unchecked_mut(i) = *a.get_unchecked(i) / *b.get_unchecked(i);
+            i += 1;
+        }
+    }
+}
+
+/// FP16 element-wise division.
+pub fn div_fp16(y: &mut [F16], a: &[F16], b: &[F16]) {
+    assert_eq!(y.len(), a.len(), "div_fp16: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "div_fp16: y/b length mismatch");
+    for i in 0..y.len() {
+        let a_f32 = a[i].to_f32();
+        let b_f32 = b[i].to_f32();
+        y[i] = F16::from_f32(a_f32 / b_f32);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// concat: concatenate tensors along an axis
+// ---------------------------------------------------------------------------
+
+/// Concatenate multiple tensors along an axis (NHWC format, typically axis=3 for channels).
+///
+/// * `output`: pre-allocated output buffer
+/// * `inputs`: slice of input tensor data
+/// * `shapes`: shapes of each input tensor (NHWC format)
+/// * `axis`: axis to concatenate along (0=N, 1=H, 2=W, 3=C)
+///
+/// # Panics
+///
+/// Panics if shapes don't match on non-concat axes or buffer sizes are wrong.
+pub fn concat_f32(
+    output: &mut [f32],
+    inputs: &[&[f32]],
+    shapes: &[[usize; 4]], // Each input's [N, H, W, C]
+    axis: usize,
+) {
+    assert!(axis < 4, "concat_f32: axis must be 0-3");
+    assert!(!inputs.is_empty(), "concat_f32: need at least one input");
+    
+    let n = shapes[0][0];
+    let h = shapes[0][1];
+    let w = shapes[0][2];
+    
+    // Verify all inputs have same dims except on concat axis
+    for shape in shapes {
+        for (i, (&d1, &d2)) in shapes[0].iter().zip(shape.iter()).enumerate() {
+            if i != axis {
+                assert_eq!(d1, d2, "concat_f32: shapes must match except on concat axis");
+            }
+        }
+    }
+    
+    // Calculate total size on concat axis
+    let total_concat_dim: usize = shapes.iter().map(|s| s[axis]).sum();
+    
+    // Verify output size
+    let mut output_shape = shapes[0];
+    output_shape[axis] = total_concat_dim;
+    let expected_output_len: usize = output_shape.iter().product();
+    assert_eq!(output.len(), expected_output_len, "concat_f32: output size mismatch");
+    
+    // Verify input sizes
+    for (input, shape) in inputs.iter().zip(shapes.iter()) {
+        let expected: usize = shape.iter().product();
+        assert_eq!(input.len(), expected, "concat_f32: input size mismatch");
+    }
+    
+    match axis {
+        3 => {
+            // Concat along channels (most common for YOLO FPN)
+            // For each (n, h, w) position, copy channels from each input sequentially
+            for batch in 0..n {
+                for y in 0..h {
+                    for x in 0..w {
+                        let mut out_offset = ((batch * h + y) * w + x) * total_concat_dim;
+                        for (input, shape) in inputs.iter().zip(shapes.iter()) {
+                            let c = shape[3];
+                            let in_offset = ((batch * h + y) * w + x) * c;
+                            output[out_offset..out_offset + c]
+                                .copy_from_slice(&input[in_offset..in_offset + c]);
+                            out_offset += c;
+                        }
+                    }
+                }
+            }
+        }
+        0 => {
+            // Concat along batch - just copy each input sequentially
+            let mut offset = 0;
+            for input in inputs {
+                output[offset..offset + input.len()].copy_from_slice(input);
+                offset += input.len();
+            }
+        }
+        1 => {
+            // Concat along height
+            let c = shapes[0][3];
+            for batch in 0..n {
+                let mut h_offset = 0;
+                for (input, shape) in inputs.iter().zip(shapes.iter()) {
+                    let h_in = shape[1];
+                    for y in 0..h_in {
+                        let total_h = total_concat_dim;
+                        let out_start = ((batch * total_h + h_offset + y) * w) * c;
+                        let in_start = (y * w) * c;
+                        let row_len = w * c;
+                        output[out_start..out_start + row_len]
+                            .copy_from_slice(&input[batch * h_in * w * c + in_start..batch * h_in * w * c + in_start + row_len]);
+                    }
+                    h_offset += h_in;
+                }
+            }
+        }
+        2 => {
+            // Concat along width
+            let c = shapes[0][3];
+            for batch in 0..n {
+                for y in 0..h {
+                    let mut w_offset = 0;
+                    let total_w = total_concat_dim;
+                    for (input, shape) in inputs.iter().zip(shapes.iter()) {
+                        let w_in = shape[2];
+                        let out_start = ((batch * h + y) * total_w + w_offset) * c;
+                        let in_start = ((batch * h + y) * w_in) * c;
+                        let row_len = w_in * c;
+                        output[out_start..out_start + row_len]
+                            .copy_from_slice(&input[in_start..in_start + row_len]);
+                        w_offset += w_in;
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// FP16 concatenation.
+pub fn concat_fp16(
+    output: &mut [F16],
+    inputs: &[&[F16]],
+    shapes: &[[usize; 4]],
+    axis: usize,
+) {
+    assert!(axis < 4, "concat_fp16: axis must be 0-3");
+    assert!(!inputs.is_empty(), "concat_fp16: need at least one input");
+    
+    let n = shapes[0][0];
+    let h = shapes[0][1];
+    let w = shapes[0][2];
+    let total_concat_dim: usize = shapes.iter().map(|s| s[axis]).sum();
+    
+    match axis {
+        3 => {
+            for batch in 0..n {
+                for y in 0..h {
+                    for x in 0..w {
+                        let mut out_offset = ((batch * h + y) * w + x) * total_concat_dim;
+                        for (input, shape) in inputs.iter().zip(shapes.iter()) {
+                            let c = shape[3];
+                            let in_offset = ((batch * h + y) * w + x) * c;
+                            output[out_offset..out_offset + c]
+                                .copy_from_slice(&input[in_offset..in_offset + c]);
+                            out_offset += c;
+                        }
+                    }
+                }
+            }
+        }
+        0 => {
+            let mut offset = 0;
+            for input in inputs {
+                output[offset..offset + input.len()].copy_from_slice(input);
+                offset += input.len();
+            }
+        }
+        _ => {
+            // Convert to f32, concat, convert back (fallback for less common axes)
+            let f32_inputs: Vec<Vec<f32>> = inputs.iter()
+                .map(|inp| inp.iter().map(|v| v.to_f32()).collect())
+                .collect();
+            let f32_refs: Vec<&[f32]> = f32_inputs.iter().map(|v| v.as_slice()).collect();
+            let mut f32_output = vec![0.0f32; output.len()];
+            concat_f32(&mut f32_output, &f32_refs, shapes, axis);
+            for (out, val) in output.iter_mut().zip(f32_output.iter()) {
+                *out = F16::from_f32(*val);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// resize: bilinear/nearest upsampling
+// ---------------------------------------------------------------------------
+
+/// Resize mode for upsampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeMode {
+    /// Nearest-neighbor interpolation.
+    Nearest,
+    /// Bilinear interpolation.
+    Bilinear,
+}
+
+/// Resize a tensor using bilinear or nearest-neighbor interpolation (NHWC format).
+///
+/// * `output`: `[N, H_out, W_out, C]`
+/// * `input`: `[N, H_in, W_in, C]`
+/// * `mode`: interpolation mode
+#[allow(clippy::too_many_arguments)]
+pub fn resize_f32(
+    output: &mut [f32],
+    input: &[f32],
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    h_out: usize,
+    w_out: usize,
+    c: usize,
+    mode: ResizeMode,
+) {
+    assert_eq!(input.len(), n * h_in * w_in * c);
+    assert_eq!(output.len(), n * h_out * w_out * c);
+    
+    let scale_h = h_in as f32 / h_out as f32;
+    let scale_w = w_in as f32 / w_out as f32;
+    
+    match mode {
+        ResizeMode::Nearest => {
+            for batch in 0..n {
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
+                        // Map output coordinate to input
+                        let ih = ((oh as f32 + 0.5) * scale_h - 0.5).round().max(0.0).min((h_in - 1) as f32) as usize;
+                        let iw = ((ow as f32 + 0.5) * scale_w - 0.5).round().max(0.0).min((w_in - 1) as f32) as usize;
+                        
+                        let in_offset = ((batch * h_in + ih) * w_in + iw) * c;
+                        let out_offset = ((batch * h_out + oh) * w_out + ow) * c;
+                        output[out_offset..out_offset + c].copy_from_slice(&input[in_offset..in_offset + c]);
+                    }
+                }
+            }
+        }
+        ResizeMode::Bilinear => {
+            for batch in 0..n {
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
+                        // Map output coordinate to input (align_corners=false convention)
+                        let ih_f = (oh as f32 + 0.5) * scale_h - 0.5;
+                        let iw_f = (ow as f32 + 0.5) * scale_w - 0.5;
+                        
+                        let ih0 = ih_f.floor().max(0.0) as usize;
+                        let iw0 = iw_f.floor().max(0.0) as usize;
+                        let ih1 = (ih0 + 1).min(h_in - 1);
+                        let iw1 = (iw0 + 1).min(w_in - 1);
+                        
+                        let fh = ih_f - ih_f.floor();
+                        let fw = iw_f - iw_f.floor();
+                        
+                        // Bilinear weights
+                        let w00 = (1.0 - fh) * (1.0 - fw);
+                        let w01 = (1.0 - fh) * fw;
+                        let w10 = fh * (1.0 - fw);
+                        let w11 = fh * fw;
+                        
+                        let idx00 = ((batch * h_in + ih0) * w_in + iw0) * c;
+                        let idx01 = ((batch * h_in + ih0) * w_in + iw1) * c;
+                        let idx10 = ((batch * h_in + ih1) * w_in + iw0) * c;
+                        let idx11 = ((batch * h_in + ih1) * w_in + iw1) * c;
+                        let out_idx = ((batch * h_out + oh) * w_out + ow) * c;
+                        
+                        for ch in 0..c {
+                            output[out_idx + ch] = 
+                                w00 * input[idx00 + ch] +
+                                w01 * input[idx01 + ch] +
+                                w10 * input[idx10 + ch] +
+                                w11 * input[idx11 + ch];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// split: split tensor along an axis
+// ---------------------------------------------------------------------------
+
+/// Split a tensor along an axis (NHWC format).
+///
+/// * `outputs`: pre-allocated output buffers
+/// * `input`: input tensor data
+/// * `shape`: input shape [N, H, W, C]
+/// * `axis`: axis to split along
+/// * `split_sizes`: size of each split along the axis
+#[allow(clippy::too_many_arguments)]
+pub fn split_f32(
+    outputs: &mut [&mut [f32]],
+    input: &[f32],
+    shape: [usize; 4],
+    axis: usize,
+    split_sizes: &[usize],
+) {
+    assert!(axis < 4, "split_f32: axis must be 0-3");
+    assert_eq!(outputs.len(), split_sizes.len(), "split_f32: outputs and split_sizes must match");
+    
+    let [n, h, w, c] = shape;
+    let total_split: usize = split_sizes.iter().sum();
+    assert_eq!(total_split, shape[axis], "split_f32: split sizes must sum to axis dimension");
+    
+    match axis {
+        3 => {
+            // Split along channels
+            for batch in 0..n {
+                for y in 0..h {
+                    for x in 0..w {
+                        let in_base = ((batch * h + y) * w + x) * c;
+                        let mut c_offset = 0;
+                        for (out, &split_c) in outputs.iter_mut().zip(split_sizes.iter()) {
+                            let out_base = ((batch * h + y) * w + x) * split_c;
+                            out[out_base..out_base + split_c]
+                                .copy_from_slice(&input[in_base + c_offset..in_base + c_offset + split_c]);
+                            c_offset += split_c;
+                        }
+                    }
+                }
+            }
+        }
+        0 => {
+            // Split along batch
+            let elem_per_batch = h * w * c;
+            let mut batch_offset = 0;
+            for (out, &split_n) in outputs.iter_mut().zip(split_sizes.iter()) {
+                let src_start = batch_offset * elem_per_batch;
+                let src_end = src_start + split_n * elem_per_batch;
+                out.copy_from_slice(&input[src_start..src_end]);
+                batch_offset += split_n;
+            }
+        }
+        _ => {
+            // Generic implementation for other axes
+            // This is less common in YOLO, so we use a simpler approach
+            unimplemented!("split_f32: axis {} not yet implemented", axis);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// transpose: permute dimensions
+// ---------------------------------------------------------------------------
+
+/// Transpose a 4D tensor with arbitrary permutation (NHWC format).
+///
+/// * `output`: pre-allocated output buffer
+/// * `input`: input tensor data
+/// * `shape`: input shape [D0, D1, D2, D3]
+/// * `perm`: permutation array, e.g., [0, 2, 3, 1] for NCHW->NHWC
+pub fn transpose_f32(
+    output: &mut [f32],
+    input: &[f32],
+    shape: [usize; 4],
+    perm: [usize; 4],
+) {
+    let [d0, d1, d2, d3] = shape;
+    let out_shape = [shape[perm[0]], shape[perm[1]], shape[perm[2]], shape[perm[3]]];
+    
+    let expected_len: usize = shape.iter().product();
+    assert_eq!(input.len(), expected_len);
+    assert_eq!(output.len(), expected_len);
+    
+    // Input strides (row-major)
+    let in_strides = [d1 * d2 * d3, d2 * d3, d3, 1];
+    // Output strides
+    let out_strides = [
+        out_shape[1] * out_shape[2] * out_shape[3],
+        out_shape[2] * out_shape[3],
+        out_shape[3],
+        1,
+    ];
+    
+    // Inverse permutation for index mapping
+    let mut inv_perm = [0usize; 4];
+    for (i, &p) in perm.iter().enumerate() {
+        inv_perm[p] = i;
+    }
+    
+    for i0 in 0..d0 {
+        for i1 in 0..d1 {
+            for i2 in 0..d2 {
+                for i3 in 0..d3 {
+                    let in_idx = i0 * in_strides[0] + i1 * in_strides[1] + 
+                                 i2 * in_strides[2] + i3 * in_strides[3];
+                    
+                    let indices = [i0, i1, i2, i3];
+                    let out_indices = [indices[perm[0]], indices[perm[1]], 
+                                       indices[perm[2]], indices[perm[3]]];
+                    let out_idx = out_indices[0] * out_strides[0] + 
+                                  out_indices[1] * out_strides[1] +
+                                  out_indices[2] * out_strides[2] + 
+                                  out_indices[3] * out_strides[3];
+                    
+                    output[out_idx] = input[in_idx];
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// slice: extract subtensor
+// ---------------------------------------------------------------------------
+
+/// Extract a slice from a tensor along specified axes.
+///
+/// * `output`: pre-allocated output buffer
+/// * `input`: input tensor data  
+/// * `input_shape`: input shape [N, H, W, C]
+/// * `starts`: start indices for each axis
+/// * `ends`: end indices for each axis
+/// * `axes`: which axes to slice (others are kept fully)
+/// * `steps`: step size for each axis (1 = all elements)
+pub fn slice_f32(
+    output: &mut [f32],
+    input: &[f32],
+    input_shape: [usize; 4],
+    starts: &[isize],
+    ends: &[isize],
+    axes: &[usize],
+    steps: &[isize],
+) {
+    let [n, h, w, c] = input_shape;
+    
+    // Compute effective ranges for each axis
+    let mut ranges: [(usize, usize, usize); 4] = [
+        (0, n, 1), (0, h, 1), (0, w, 1), (0, c, 1)
+    ];
+    
+    for (i, &axis) in axes.iter().enumerate() {
+        let dim = input_shape[axis] as isize;
+        let start = if starts[i] < 0 { (dim + starts[i]).max(0) } else { starts[i].min(dim) } as usize;
+        let end = if ends[i] < 0 { (dim + ends[i]).max(0) } else { ends[i].min(dim) } as usize;
+        let step = steps.get(i).copied().unwrap_or(1).max(1) as usize;
+        ranges[axis] = (start, end, step);
+    }
+    
+    let mut out_idx = 0;
+    for i0 in (ranges[0].0..ranges[0].1).step_by(ranges[0].2) {
+        for i1 in (ranges[1].0..ranges[1].1).step_by(ranges[1].2) {
+            for i2 in (ranges[2].0..ranges[2].1).step_by(ranges[2].2) {
+                for i3 in (ranges[3].0..ranges[3].1).step_by(ranges[3].2) {
+                    let in_idx = ((i0 * h + i1) * w + i2) * c + i3;
+                    output[out_idx] = input[in_idx];
+                    out_idx += 1;
+                }
+            }
+        }
+    }
 }
 
 /// Multi-threaded FP16 2D convolution.

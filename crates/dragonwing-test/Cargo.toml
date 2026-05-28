@@ -15,6 +15,7 @@ workspace = true
 dragonwing-core = { path = "../dragonwing-core" }
 dragonwing-cpu = { path = "../dragonwing-cpu" }
 dragonwing-vulkan = { path = "../dragonwing-vulkan" }
+dragonwing-onnx = { path = "../dragonwing-onnx" }
 
 [[bin]]
 name = "parity-test"

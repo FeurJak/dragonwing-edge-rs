@@ -48,12 +48,16 @@ mod model;
 mod builder;
 mod graph;
 mod runtime;
+mod postprocess;
+mod fusion;
 
 pub use error::{Error, Result};
 pub use model::{Model, OnnxNode, OnnxTensor, OnnxAttribute, AttributeValue, DataType};
 pub use builder::{OpBuilder, BuildContext, UnsupportedReason, ValidationReport, TensorShape, CompiledOp, OpParams};
 pub use graph::{Graph, validate_model, compile_model, fold_batchnorm, convert_nchw_to_nhwc, transpose_nchw_to_nhwc, transpose_nhwc_to_nchw};
 pub use runtime::GraphRuntime;
+pub use postprocess::{Detection, iou, decode_detections_v8, decode_detections_v8_alt, nms, nms_agnostic, postprocess_yolo};
+pub use fusion::{apply_fusion_passes, count_fuseable_patterns, FusionStats};
 
 /// CPU-optimized graph runtime (requires `cpu` feature).
 #[cfg(feature = "cpu")]
