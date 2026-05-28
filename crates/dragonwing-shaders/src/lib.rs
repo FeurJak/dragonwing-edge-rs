@@ -97,6 +97,14 @@ pub const GEMM_FP16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_fp16
 pub const CONV2D_F32_NHWC: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/conv2d_f32_nhwc.spv"));
 
+/// `conv2d_fp16_nhwc` — Direct 2D convolution in NHWC format with FP16 I/O.
+///
+/// Uses FP16 for input/output buffers but accumulates in FP32 for precision.
+/// Push-constant layout: 64 bytes (4 uvec4).
+/// Dispatch: `gx = ceil(w_out/8), gy = ceil(h_out/8), gz = n * c_out`.
+pub const CONV2D_FP16_NHWC: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/conv2d_fp16_nhwc.spv"));
+
 /// `maxpool2d_f32` — 2D max pooling in NHWC format.
 ///
 /// Push-constant layout: 64 bytes (4 uvec4).
@@ -149,6 +157,7 @@ pub const ALL: &[(&str, &[u8])] = &[
     ("gemm_f32_naive", GEMM_F32_NAIVE),
     ("gemm_f32_tiled", GEMM_F32_TILED),
     ("conv2d_f32_nhwc", CONV2D_F32_NHWC),
+    ("conv2d_fp16_nhwc", CONV2D_FP16_NHWC),
     ("maxpool2d_f32", MAXPOOL2D_F32),
     ("softmax_f32", SOFTMAX_F32),
     ("fill_fp16", FILL_FP16),

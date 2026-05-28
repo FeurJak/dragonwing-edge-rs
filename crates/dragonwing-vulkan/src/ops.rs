@@ -1334,6 +1334,83 @@ pub fn conv2d_f32_nhwc(
     one_shot.submit()
 }
 
+/// 2D convolution in NHWC format with FP16 input/output.
+///
+/// Uses FP16 for input/output and kernel buffers but accumulates in FP32.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_fp16_nhwc(
+    backend: &VulkanBackend,
+    input: &VulkanBuffer,
+    kernel: &VulkanBuffer,
+    output: &mut VulkanBuffer,
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    c_out: usize,
+    k_h: usize,
+    k_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) -> Result<()> {
+    let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+    let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+    // FP16 = 2 bytes per element
+    let expected_input = n * h_in * w_in * c_in * 2;
+    let expected_kernel = k_h * k_w * c_in * c_out * 2;
+    let expected_output = n * h_out * w_out * c_out * 2;
+
+    if input.len_bytes() != expected_input {
+        return Err(Error::Backend(format!("conv2d_fp16: input size mismatch: expected {expected_input}, got {}", input.len_bytes())));
+    }
+    if kernel.len_bytes() != expected_kernel {
+        return Err(Error::Backend(format!("conv2d_fp16: kernel size mismatch: expected {expected_kernel}, got {}", kernel.len_bytes())));
+    }
+    if output.len_bytes() != expected_output {
+        return Err(Error::Backend(format!("conv2d_fp16: output size mismatch: expected {expected_output}, got {}", output.len_bytes())));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::Conv2dFp16Nhwc)?;
+    let desc_set = backend.pipelines().allocate_descriptor_set(cached.descriptor_set_layout)?;
+
+    let buf_infos = [
+        vk::DescriptorBufferInfo { buffer: output.vk_buffer(), offset: 0, range: vk::WHOLE_SIZE },
+        vk::DescriptorBufferInfo { buffer: input.vk_buffer(), offset: 0, range: vk::WHOLE_SIZE },
+        vk::DescriptorBufferInfo { buffer: kernel.vk_buffer(), offset: 0, range: vk::WHOLE_SIZE },
+    ];
+    let writes = [
+        vk::WriteDescriptorSet::default().dst_set(desc_set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&buf_infos[0..1]),
+        vk::WriteDescriptorSet::default().dst_set(desc_set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&buf_infos[1..2]),
+        vk::WriteDescriptorSet::default().dst_set(desc_set).dst_binding(2).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&buf_infos[2..3]),
+    ];
+    unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushConv { dims0: [u32; 4], dims1: [u32; 4], dims2: [u32; 4], dims3: [u32; 4] }
+    let pc = PushConv {
+        dims0: [h_in as u32, w_in as u32, c_in as u32, c_out as u32],
+        dims1: [k_h as u32, k_w as u32, stride_h as u32, stride_w as u32],
+        dims2: [pad_h as u32, pad_w as u32, h_out as u32, w_out as u32],
+        dims3: [n as u32, 0, 0, 0],
+    };
+    let pc_bytes: &[u8] = unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), 64) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.layout, 0, &[desc_set], &[]);
+        device.cmd_push_constants(one_shot.cmd, cached.layout, vk::ShaderStageFlags::COMPUTE, 0, pc_bytes);
+        device.cmd_dispatch(one_shot.cmd, (w_out as u32).div_ceil(8), (h_out as u32).div_ceil(8), (n * c_out) as u32);
+    }
+    one_shot.end()?;
+    one_shot.submit()
+}
+
 /// 2D max pooling in NHWC format.
 #[allow(clippy::too_many_arguments)]
 pub fn maxpool2d_f32(

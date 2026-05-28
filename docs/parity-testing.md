@@ -119,6 +119,25 @@ Floating-point results can differ between CPU and GPU due to:
 | `gemm_fp16` | 5e-3 relative | F32 accumulator over K terms, FP16 result; tolerance reflects mantissa precision (10 bits) |
 | `conv2d_fp16_nhwc` (CPU only) | 5e-3 relative | Same accumulation model as `gemm_fp16` |
 
+#### Task 004 ops
+
+| Op Type | Tolerance | Rationale |
+|---------|-----------|-----------|
+| `depthwise_conv2d_f32_nhwc` | 1e-4 relative | Same as standard conv; kernel is 3×3 so K=9 |
+| `depthwise_conv2d_fp16_nhwc` | 5e-3 relative | F32 accumulator, FP16 inputs/outputs |
+| `relu6_f32` | 0.0 | Exact clamp operation |
+| `relu6_fp16` | 0.0 | Exact clamp (within FP16 representability) |
+| `global_avg_pool_f32_nhwc` | 1e-5 | Sum over H×W elements; typical spatial is 7×7=49 |
+| `global_avg_pool_fp16_nhwc` | 1e-3 | F32 accumulator, FP16 result |
+
+#### End-to-end MobileNetV2
+
+| Comparison | Tolerance | Notes |
+|------------|-----------|-------|
+| CPU F32 vs reference | 1e-3 relative | Top-5 logit comparison |
+| CPU F16 vs reference | 5e-2 relative | Wider tolerance for FP16 accumulation |
+| Vulkan F32 vs CPU F32 | 1e-3 relative | (Task 005 — not yet tested) |
+
 ### Scaling with Problem Size
 
 For GEMM, error grows with `K` (inner dimension):
@@ -156,6 +175,9 @@ let (a, b, m, n, k) = generators::gemm_test_data(0x12345);
 | conv2d | input [-1, 1], weights [-0.5, 0.5] | Same accumulation budget as GEMM |
 | maxpool / avgpool | [-10, 10] | Mix of magnitudes |
 | softmax | [-5, 5] | After max-subtraction, exp inputs land in [-10, 0]; tractable |
+| depthwise conv | input [-1, 1], weights [-0.5, 0.5] | Same as standard conv (K=9 for 3×3) |
+| global_avg_pool | [-10, 10] | Sum over spatial dims |
+| relu6 / clip | [-10, 10] | Mix of values inside and outside [0, 6] |
 | FP16 variants of above | same range, narrower distribution | FP16 max ≈ 65504; we stay well clear |
 
 ### End-to-end micro-graph
@@ -173,10 +195,34 @@ Input 1×28×28×1
   → Softmax
 ```
 
-Tolerance: `1e-4` relative for the whole pipeline. The test does not yet run
-end-to-end on Vulkan — it validates CPU multi-thread parity, deterministic
-output for a fixed seed, and that different seeds produce different output.
-Vulkan end-to-end parity is task 004 once the FP16 conv shader lands.
+Tolerance: `1e-4` relative for the whole pipeline. The test validates CPU
+multi-thread parity, deterministic output for a fixed seed, and that different
+seeds produce different output.
+
+### End-to-end MobileNetV2 (task 004)
+
+The `dragonwing-onnx` crate includes an end-to-end MobileNetV2 test:
+
+```
+Input 1×224×224×3 (NHWC, after layout conversion)
+  → 52 Conv layers (standard + depthwise)
+  → BatchNorm (folded into Conv at load time)
+  → ReLU6 activations
+  → GlobalAveragePool
+  → Gemm (1280 → 1000)
+  → Softmax
+```
+
+The test:
+1. Loads `artifacts/models/mobilenetv2-12.onnx`
+2. Folds BatchNorm into preceding Conv
+3. Converts NCHW → NHWC
+4. Runs inference on CPU
+5. Compares top-5 predictions against reference
+
+Tolerance: `1e-3` relative for F32, `5e-2` relative for FP16.
+
+Note: Vulkan end-to-end parity testing is planned for task 005.
 
 ## Programmatic Usage
 

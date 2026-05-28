@@ -1,0 +1,117 @@
+#version 450
+//
+// conv2d_fp16_nhwc — Direct 2D convolution in NHWC format with FP16 I/O.
+//
+// This is the FP16 variant of conv2d_f32_nhwc. It uses FP16 for input/output
+// and kernel buffers but accumulates in FP32 for numerical stability.
+//
+// Extensions required:
+//   GL_EXT_shader_16bit_storage       — for float16_t SSBO load/store
+//   GL_EXT_shader_explicit_arithmetic_types_float16 — for float16_t type
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Output[N*H_out*W_out*C_out]  (write-only, F16)
+//   set=0 binding=1  std430 buffer Input[N*H_in*W_in*C_in]      (read-only, F16)
+//   set=0 binding=2  std430 buffer Kernel[K_h*K_w*C_in*C_out]   (read-only, F16)
+//
+// Push constants (64 bytes):
+//   uvec4 dims0: { h_in, w_in, c_in, c_out }
+//   uvec4 dims1: { k_h, k_w, stride_h, stride_w }
+//   uvec4 dims2: { pad_h, pad_w, h_out, w_out }
+//   uint  n     : batch size
+//   uint  _pad0, _pad1, _pad2
+//
+// Dispatch:
+//   gx = ceil(w_out / 8), gy = ceil(h_out / 8), gz = n * c_out
+//
+// Workgroup: 8x8x1 = 64 invocations
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float16_t output_data[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuf {
+    float16_t input_data[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer KernelBuf {
+    float16_t kernel_data[];
+};
+
+layout(push_constant) uniform Pc {
+    uvec4 dims0;  // h_in, w_in, c_in, c_out
+    uvec4 dims1;  // k_h, k_w, stride_h, stride_w
+    uvec4 dims2;  // pad_h, pad_w, h_out, w_out
+    uvec4 dims3;  // n, _pad0, _pad1, _pad2
+} pc;
+
+void main() {
+    uint h_in = pc.dims0.x;
+    uint w_in = pc.dims0.y;
+    uint c_in = pc.dims0.z;
+    uint c_out = pc.dims0.w;
+    
+    uint k_h = pc.dims1.x;
+    uint k_w = pc.dims1.y;
+    uint stride_h = pc.dims1.z;
+    uint stride_w = pc.dims1.w;
+    
+    uint pad_h = pc.dims2.x;
+    uint pad_w = pc.dims2.y;
+    uint h_out = pc.dims2.z;
+    uint w_out = pc.dims2.w;
+    
+    uint n = pc.dims3.x;
+    
+    // Output position
+    uint ow = gl_GlobalInvocationID.x;
+    uint oh = gl_GlobalInvocationID.y;
+    uint batch_oc = gl_GlobalInvocationID.z;
+    uint batch = batch_oc / c_out;
+    uint oc = batch_oc % c_out;
+    
+    // Bounds check
+    if (ow >= w_out || oh >= h_out || batch >= n) {
+        return;
+    }
+    
+    // Accumulate in F32 for precision
+    float acc = 0.0;
+    
+    // Convolve
+    for (uint kh = 0u; kh < k_h; kh++) {
+        for (uint kw = 0u; kw < k_w; kw++) {
+            // Input position (with padding offset)
+            int ih = int(oh * stride_h + kh) - int(pad_h);
+            int iw = int(ow * stride_w + kw) - int(pad_w);
+            
+            // Skip if outside input bounds (zero-padding)
+            if (ih < 0 || ih >= int(h_in) || iw < 0 || iw >= int(w_in)) {
+                continue;
+            }
+            
+            // Sum over input channels
+            for (uint ic = 0u; ic < c_in; ic++) {
+                // Input index: [batch, ih, iw, ic] in NHWC
+                uint input_idx = ((batch * h_in + uint(ih)) * w_in + uint(iw)) * c_in + ic;
+                // Kernel index: [kh, kw, ic, oc]
+                uint kernel_idx = ((kh * k_w + kw) * c_in + ic) * c_out + oc;
+                
+                // Load F16, convert to F32 for accumulation
+                float inp = float(input_data[input_idx]);
+                float ker = float(kernel_data[kernel_idx]);
+                acc = fma(inp, ker, acc);
+            }
+        }
+    }
+    
+    // Output index: [batch, oh, ow, oc] in NHWC
+    uint output_idx = ((batch * h_out + oh) * w_out + ow) * c_out + oc;
+    // Convert back to F16 on store
+    output_data[output_idx] = float16_t(acc);
+}
