@@ -168,6 +168,15 @@ impl<B: Backend> GraphRuntime<B> {
                     "MaxPool/AvgPool not implemented in generic runtime, use CpuGraphRuntime"
                 )));
             }
+            // YOLO ops (Task 005) - defer to CpuGraphRuntime for full implementation
+            OpParams::Sigmoid | OpParams::Mul | OpParams::Concat { .. } |
+            OpParams::Resize { .. } | OpParams::Split { .. } | 
+            OpParams::Transpose { .. } | OpParams::Slice { .. } => {
+                return Err(Error::Runtime(format!(
+                    "{} not implemented in generic runtime, use CpuGraphRuntime",
+                    op.op_type
+                )));
+            }
         }
         Ok(())
     }
@@ -881,6 +890,20 @@ mod cpu_runtime {
                 OpParams::AvgPool { kernel_shape, strides, pads: _ } => {
                     self.dispatch_avgpool(op, *kernel_shape, *strides)
                 }
+                // YOLO ops (Task 005)
+                OpParams::Sigmoid => self.dispatch_sigmoid(op),
+                OpParams::Mul => self.dispatch_mul(op),
+                OpParams::Concat { axis } => self.dispatch_concat(op, *axis),
+                OpParams::Resize { out_h, out_w, mode } => {
+                    self.dispatch_resize(op, *out_h, *out_w, mode)
+                }
+                OpParams::Split { axis, split_sizes } => {
+                    self.dispatch_split(op, *axis, split_sizes)
+                }
+                OpParams::Transpose { perm } => self.dispatch_transpose(op, perm),
+                OpParams::Slice { starts, ends, axes, steps } => {
+                    self.dispatch_slice(op, starts, ends, axes, steps)
+                }
             }
         }
 
@@ -1573,6 +1596,399 @@ mod cpu_runtime {
                     }
                 }
                 _ => return Err(Error::Runtime("unsupported dtype for avgpool".into())),
+            }
+            Ok(())
+        }
+
+        // =====================================================================
+        // YOLO ops dispatchers (Task 005)
+        // =====================================================================
+
+        fn dispatch_sigmoid(&mut self, op: &CompiledOp) -> Result<()> {
+            let input_name = &op.inputs[0];
+            let output_name = &op.outputs[0];
+
+            let (input_ptr, output_ptr) = if input_name == output_name {
+                // In-place operation
+                let buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                (buf as *const CpuBuffer, buf as *const CpuBuffer as *mut CpuBuffer)
+            } else {
+                let input_buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                let output_buf = self.buffers.get(output_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {output_name}")))?;
+                (input_buf as *const CpuBuffer, output_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+
+            match self.graph.dtype {
+                Dtype::F32 => {
+                    let input = unsafe { (*input_ptr).as_f32() };
+                    let output = unsafe { (*output_ptr).as_f32_mut() };
+                    ops::sigmoid_f32(output, input);
+                }
+                Dtype::F16 => {
+                    let input = unsafe { (*input_ptr).as_f16() };
+                    let output = unsafe { (*output_ptr).as_f16_mut() };
+                    ops::sigmoid_fp16(output, input);
+                }
+                _ => return Err(Error::Runtime("unsupported dtype for sigmoid".into())),
+            }
+            Ok(())
+        }
+
+        fn dispatch_mul(&mut self, op: &CompiledOp) -> Result<()> {
+            let a_name = &op.inputs[0];
+            let b_name = &op.inputs[1];
+            let out_name = &op.outputs[0];
+
+            let a_shape = self.graph.shapes.get(a_name)
+                .ok_or_else(|| Error::Runtime(format!("shape not found: {a_name}")))?;
+            let n = a_shape.numel();
+
+            let (a_ptr, b_ptr, out_ptr) = {
+                let a_buf = self.buffers.get(a_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {a_name}")))?;
+                let b_buf = self.buffers.get(b_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {b_name}")))?;
+                let out_buf = self.buffers.get(out_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {out_name}")))?;
+                (a_buf as *const CpuBuffer, b_buf as *const CpuBuffer, 
+                 out_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+
+            match self.graph.dtype {
+                Dtype::F32 => {
+                    let a = unsafe { (*a_ptr).as_f32() };
+                    let b = unsafe { (*b_ptr).as_f32() };
+                    let output = unsafe { (*out_ptr).as_f32_mut() };
+                    
+                    // Handle broadcasting
+                    if a.len() == b.len() {
+                        ops::mul_f32(output, a, b);
+                    } else if b.len() == 1 {
+                        // Scalar broadcast
+                        let bv = b[0];
+                        for (o, &av) in output.iter_mut().zip(a.iter()) {
+                            *o = av * bv;
+                        }
+                    } else {
+                        // Channel broadcast
+                        let c = b.len();
+                        for (i, (o, &av)) in output.iter_mut().zip(a.iter()).enumerate() {
+                            *o = av * b[i % c];
+                        }
+                    }
+                }
+                Dtype::F16 => {
+                    let a = unsafe { (*a_ptr).as_f16() };
+                    let b = unsafe { (*b_ptr).as_f16() };
+                    let output = unsafe { (*out_ptr).as_f16_mut() };
+                    
+                    if a.len() == b.len() {
+                        ops::mul_fp16(output, a, b);
+                    } else {
+                        let c = b.len();
+                        for (i, (o, av)) in output.iter_mut().zip(a.iter()).enumerate() {
+                            *o = F16::from_f32(av.to_f32() * b[i % c].to_f32());
+                        }
+                    }
+                }
+                _ => return Err(Error::Runtime("unsupported dtype for mul".into())),
+            }
+            Ok(())
+        }
+
+        fn dispatch_concat(&mut self, op: &CompiledOp, axis: usize) -> Result<()> {
+            let output_name = &op.outputs[0];
+            
+            // Gather input shapes and data
+            let mut input_shapes: Vec<[usize; 4]> = Vec::new();
+            let mut input_ptrs: Vec<*const CpuBuffer> = Vec::new();
+            
+            for input_name in &op.inputs {
+                let shape = self.graph.shapes.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("shape not found: {input_name}")))?;
+                
+                // Pad to 4D if needed
+                let mut dims = [1usize; 4];
+                let offset = 4 - shape.dims.len();
+                for (i, &d) in shape.dims.iter().enumerate() {
+                    dims[offset + i] = d;
+                }
+                input_shapes.push(dims);
+                
+                let buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                input_ptrs.push(buf as *const CpuBuffer);
+            }
+
+            let output_ptr = {
+                let out_buf = self.buffers.get(output_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {output_name}")))?;
+                out_buf as *const CpuBuffer as *mut CpuBuffer
+            };
+
+            match self.graph.dtype {
+                Dtype::F32 => {
+                    let inputs: Vec<&[f32]> = input_ptrs.iter()
+                        .map(|&ptr| unsafe { (*ptr).as_f32() })
+                        .collect();
+                    let output = unsafe { (*output_ptr).as_f32_mut() };
+                    ops::concat_f32(output, &inputs, &input_shapes, axis);
+                }
+                Dtype::F16 => {
+                    let inputs: Vec<&[F16]> = input_ptrs.iter()
+                        .map(|&ptr| unsafe { (*ptr).as_f16() })
+                        .collect();
+                    let output = unsafe { (*output_ptr).as_f16_mut() };
+                    ops::concat_fp16(output, &inputs, &input_shapes, axis);
+                }
+                _ => return Err(Error::Runtime("unsupported dtype for concat".into())),
+            }
+            Ok(())
+        }
+
+        fn dispatch_resize(
+            &mut self,
+            op: &CompiledOp,
+            out_h: usize,
+            out_w: usize,
+            mode: &str,
+        ) -> Result<()> {
+            let input_name = &op.inputs[0];
+            let output_name = &op.outputs[0];
+
+            let input_shape = self.graph.shapes.get(input_name)
+                .ok_or_else(|| Error::Runtime(format!("shape not found: {input_name}")))?;
+
+            if input_shape.dims.len() != 4 {
+                return Err(Error::Runtime("Resize input must be 4D".into()));
+            }
+
+            let n = input_shape.dims[0];
+            let h_in = input_shape.dims[1];
+            let w_in = input_shape.dims[2];
+            let c = input_shape.dims[3];
+
+            let resize_mode = match mode {
+                "nearest" => ops::ResizeMode::Nearest,
+                "linear" => ops::ResizeMode::Bilinear,
+                _ => return Err(Error::Runtime(format!("unsupported resize mode: {mode}"))),
+            };
+
+            let (input_ptr, output_ptr) = {
+                let input_buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                let output_buf = self.buffers.get(output_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {output_name}")))?;
+                (input_buf as *const CpuBuffer, output_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+
+            match self.graph.dtype {
+                Dtype::F32 => {
+                    let input = unsafe { (*input_ptr).as_f32() };
+                    let output = unsafe { (*output_ptr).as_f32_mut() };
+                    ops::resize_f32(output, input, n, h_in, w_in, out_h, out_w, c, resize_mode);
+                }
+                Dtype::F16 => {
+                    // Convert to F32, resize, convert back
+                    let input = unsafe { (*input_ptr).as_f16() };
+                    let output = unsafe { (*output_ptr).as_f16_mut() };
+                    
+                    let input_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+                    let mut output_f32 = vec![0.0f32; n * out_h * out_w * c];
+                    ops::resize_f32(&mut output_f32, &input_f32, n, h_in, w_in, out_h, out_w, c, resize_mode);
+                    
+                    for (o, &v) in output.iter_mut().zip(output_f32.iter()) {
+                        *o = F16::from_f32(v);
+                    }
+                }
+                _ => return Err(Error::Runtime("unsupported dtype for resize".into())),
+            }
+            Ok(())
+        }
+
+        fn dispatch_split(
+            &mut self,
+            op: &CompiledOp,
+            axis: usize,
+            split_sizes: &[usize],
+        ) -> Result<()> {
+            let input_name = &op.inputs[0];
+            
+            let input_shape = self.graph.shapes.get(input_name)
+                .ok_or_else(|| Error::Runtime(format!("shape not found: {input_name}")))?;
+            
+            // Pad to 4D
+            let mut shape = [1usize; 4];
+            let offset = 4 - input_shape.dims.len();
+            for (i, &d) in input_shape.dims.iter().enumerate() {
+                shape[offset + i] = d;
+            }
+
+            let input_ptr = {
+                let buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                buf as *const CpuBuffer
+            };
+
+            // Get output buffer pointers
+            let mut output_ptrs: Vec<*mut CpuBuffer> = Vec::new();
+            for output_name in &op.outputs {
+                let buf = self.buffers.get(output_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {output_name}")))?;
+                output_ptrs.push(buf as *const CpuBuffer as *mut CpuBuffer);
+            }
+
+            match self.graph.dtype {
+                Dtype::F32 => {
+                    let input = unsafe { (*input_ptr).as_f32() };
+                    let mut outputs: Vec<&mut [f32]> = output_ptrs.iter()
+                        .map(|&ptr| unsafe { (*ptr).as_f32_mut() })
+                        .collect();
+                    let mut output_refs: Vec<&mut [f32]> = outputs.iter_mut()
+                        .map(|s| &mut s[..])
+                        .collect();
+                    ops::split_f32(&mut output_refs, input, shape, axis, split_sizes);
+                }
+                Dtype::F16 => {
+                    // Convert to F32, split, convert back
+                    let input = unsafe { (*input_ptr).as_f16() };
+                    let input_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+                    
+                    // Allocate F32 outputs
+                    let mut output_f32s: Vec<Vec<f32>> = split_sizes.iter()
+                        .map(|&size| {
+                            let mut out_shape = shape;
+                            out_shape[axis] = size;
+                            vec![0.0f32; out_shape.iter().product()]
+                        })
+                        .collect();
+                    
+                    let mut output_refs: Vec<&mut [f32]> = output_f32s.iter_mut()
+                        .map(|v| v.as_mut_slice())
+                        .collect();
+                    
+                    ops::split_f32(&mut output_refs, &input_f32, shape, axis, split_sizes);
+                    
+                    // Convert back to F16
+                    for (&ptr, f32_data) in output_ptrs.iter().zip(output_f32s.iter()) {
+                        let output = unsafe { (*ptr).as_f16_mut() };
+                        for (o, &v) in output.iter_mut().zip(f32_data.iter()) {
+                            *o = F16::from_f32(v);
+                        }
+                    }
+                }
+                _ => return Err(Error::Runtime("unsupported dtype for split".into())),
+            }
+            Ok(())
+        }
+
+        fn dispatch_transpose(&mut self, op: &CompiledOp, perm: &[usize]) -> Result<()> {
+            let input_name = &op.inputs[0];
+            let output_name = &op.outputs[0];
+
+            let input_shape = self.graph.shapes.get(input_name)
+                .ok_or_else(|| Error::Runtime(format!("shape not found: {input_name}")))?;
+
+            if input_shape.dims.len() != 4 {
+                return Err(Error::Runtime("Transpose only supports 4D tensors".into()));
+            }
+
+            let shape: [usize; 4] = [
+                input_shape.dims[0],
+                input_shape.dims[1],
+                input_shape.dims[2],
+                input_shape.dims[3],
+            ];
+            let perm_arr: [usize; 4] = [perm[0], perm[1], perm[2], perm[3]];
+
+            let (input_ptr, output_ptr) = {
+                let input_buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                let output_buf = self.buffers.get(output_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {output_name}")))?;
+                (input_buf as *const CpuBuffer, output_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+
+            match self.graph.dtype {
+                Dtype::F32 => {
+                    let input = unsafe { (*input_ptr).as_f32() };
+                    let output = unsafe { (*output_ptr).as_f32_mut() };
+                    ops::transpose_f32(output, input, shape, perm_arr);
+                }
+                Dtype::F16 => {
+                    // Convert to F32, transpose, convert back
+                    let input = unsafe { (*input_ptr).as_f16() };
+                    let output = unsafe { (*output_ptr).as_f16_mut() };
+                    
+                    let input_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+                    let mut output_f32 = vec![0.0f32; input_f32.len()];
+                    ops::transpose_f32(&mut output_f32, &input_f32, shape, perm_arr);
+                    
+                    for (o, &v) in output.iter_mut().zip(output_f32.iter()) {
+                        *o = F16::from_f32(v);
+                    }
+                }
+                _ => return Err(Error::Runtime("unsupported dtype for transpose".into())),
+            }
+            Ok(())
+        }
+
+        fn dispatch_slice(
+            &mut self,
+            op: &CompiledOp,
+            starts: &[isize],
+            ends: &[isize],
+            axes: &[usize],
+            steps: &[isize],
+        ) -> Result<()> {
+            let input_name = &op.inputs[0];
+            let output_name = &op.outputs[0];
+
+            let input_shape = self.graph.shapes.get(input_name)
+                .ok_or_else(|| Error::Runtime(format!("shape not found: {input_name}")))?;
+
+            if input_shape.dims.len() != 4 {
+                return Err(Error::Runtime("Slice only supports 4D tensors".into()));
+            }
+
+            let shape: [usize; 4] = [
+                input_shape.dims[0],
+                input_shape.dims[1],
+                input_shape.dims[2],
+                input_shape.dims[3],
+            ];
+
+            let (input_ptr, output_ptr) = {
+                let input_buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                let output_buf = self.buffers.get(output_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {output_name}")))?;
+                (input_buf as *const CpuBuffer, output_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+
+            match self.graph.dtype {
+                Dtype::F32 => {
+                    let input = unsafe { (*input_ptr).as_f32() };
+                    let output = unsafe { (*output_ptr).as_f32_mut() };
+                    ops::slice_f32(output, input, shape, starts, ends, axes, steps);
+                }
+                Dtype::F16 => {
+                    // Convert to F32, slice, convert back
+                    let input = unsafe { (*input_ptr).as_f16() };
+                    let output = unsafe { (*output_ptr).as_f16_mut() };
+                    
+                    let input_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+                    let mut output_f32 = vec![0.0f32; output.len()];
+                    ops::slice_f32(&mut output_f32, &input_f32, shape, starts, ends, axes, steps);
+                    
+                    for (o, &v) in output.iter_mut().zip(output_f32.iter()) {
+                        *o = F16::from_f32(v);
+                    }
+                }
+                _ => return Err(Error::Runtime("unsupported dtype for slice".into())),
             }
             Ok(())
         }

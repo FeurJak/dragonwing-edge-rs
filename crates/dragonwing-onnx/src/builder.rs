@@ -229,6 +229,47 @@ pub enum OpParams {
         /// Padding [top, left, bottom, right].
         pads: [usize; 4],
     },
+    /// Sigmoid (no params).
+    Sigmoid,
+    /// Mul (elementwise, no params).
+    Mul,
+    /// Concat parameters.
+    Concat {
+        /// Axis to concatenate along.
+        axis: usize,
+    },
+    /// Resize parameters.
+    Resize {
+        /// Output height.
+        out_h: usize,
+        /// Output width.
+        out_w: usize,
+        /// Interpolation mode: "nearest" or "linear".
+        mode: String,
+    },
+    /// Split parameters.
+    Split {
+        /// Axis to split along.
+        axis: usize,
+        /// Sizes of each split.
+        split_sizes: Vec<usize>,
+    },
+    /// Transpose parameters.
+    Transpose {
+        /// Permutation array.
+        perm: Vec<usize>,
+    },
+    /// Slice parameters.
+    Slice {
+        /// Start indices.
+        starts: Vec<isize>,
+        /// End indices.
+        ends: Vec<isize>,
+        /// Axes to slice.
+        axes: Vec<usize>,
+        /// Steps.
+        steps: Vec<isize>,
+    },
 }
 
 /// Validation report from the validate pass.
@@ -278,6 +319,12 @@ pub fn get_builder(op_type: &str) -> Option<&'static dyn OpBuilder> {
         "Gather" => Some(&GATHER_BUILDER),
         "Concat" => Some(&CONCAT_BUILDER),
         "Constant" => Some(&CONSTANT_BUILDER),
+        // YOLO ops (Task 005)
+        "Sigmoid" => Some(&SIGMOID_BUILDER),
+        "Mul" => Some(&MUL_BUILDER),
+        "Resize" => Some(&RESIZE_BUILDER),
+        "Split" => Some(&SPLIT_BUILDER),
+        "Slice" => Some(&SLICE_BUILDER),
         _ => None,
     }
 }
@@ -1188,10 +1235,68 @@ macro_rules! placeholder_builder {
 }
 
 placeholder_builder!(SqueezeBuilderImpl, SQUEEZE_BUILDER, "Squeeze");
-placeholder_builder!(TransposeBuilderImpl, TRANSPOSE_BUILDER, "Transpose");
 placeholder_builder!(BatchNormBuilderImpl, BATCHNORM_BUILDER, "BatchNormalization");
 placeholder_builder!(PadBuilderImpl, PAD_BUILDER, "Pad");
 // MaxPool and AveragePool are implemented above
+
+// --- Transpose (full implementation) ---
+struct TransposeBuilderImpl;
+static TRANSPOSE_BUILDER: TransposeBuilderImpl = TransposeBuilderImpl;
+
+impl OpBuilder for TransposeBuilderImpl {
+    fn op_type(&self) -> &'static str { "Transpose" }
+    
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.len() != 1 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "1",
+            });
+        }
+        Ok(())
+    }
+    
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("Transpose: input {} not found", node.inputs[0])))?;
+        
+        // Get perm attribute or default to reverse
+        let perm = node.get_attr_ints("perm");
+        let perm: Vec<usize> = if !perm.is_empty() {
+            perm.iter().map(|&p| p as usize).collect()
+        } else {
+            (0..input_shape.dims.len()).rev().collect()
+        };
+        
+        // Apply permutation to output shape
+        let out_dims: Vec<usize> = perm.iter().map(|&p| input_shape.dims[p]).collect();
+        
+        Ok(TensorShape::new(out_dims, input_shape.dtype))
+    }
+    
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("Transpose: input {} not found", node.inputs[0])))?;
+        let output_shape = self.validate(node, ctx)?;
+        
+        let perm = node.get_attr_ints("perm");
+        let perm: Vec<usize> = if !perm.is_empty() {
+            perm.iter().map(|&p| p as usize).collect()
+        } else {
+            (0..input_shape.dims.len()).rev().collect()
+        };
+        
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Transpose".into(),
+            inputs: node.inputs.clone(),
+            outputs: node.outputs.clone(),
+            params: OpParams::Transpose { perm },
+        })
+    }
+}
 
 // =============================================================================
 // Shape manipulation ops for constant folding
@@ -1533,18 +1638,17 @@ impl OpBuilder for ConcatBuilderImpl {
     
     fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
         let output_shape = self.validate(node, ctx)?;
+        let first_shape = ctx.get_shape(&node.inputs[0]).unwrap();
+        
+        let axis = {
+            let a = node.get_attr_int("axis", 0);
+            if a < 0 { (first_shape.dims.len() as i64 + a) as usize } else { a as usize }
+        };
         
         // If all inputs are constants, fold
         let all_constant = node.inputs.iter().all(|name| ctx.is_constant(name));
         if all_constant {
-            let axis = {
-                let first_shape = ctx.get_shape(&node.inputs[0]).unwrap();
-                let a = node.get_attr_int("axis", 0);
-                if a < 0 { (first_shape.dims.len() as i64 + a) as usize } else { a as usize }
-            };
-            
             // Simple case: 1D tensors (common for shape manipulation)
-            let first_shape = ctx.get_shape(&node.inputs[0]).unwrap();
             if first_shape.dims.len() == 1 && axis == 0 {
                 let mut result = Vec::new();
                 for input in &node.inputs {
@@ -1563,7 +1667,382 @@ impl OpBuilder for ConcatBuilderImpl {
             op_type: "Concat".into(),
             inputs: if ctx.is_constant(&node.outputs[0]) { vec![] } else { node.inputs.clone() },
             outputs: node.outputs.clone(),
-            params: OpParams::None,
+            params: OpParams::Concat { axis },
         })
     }
+}
+
+// =============================================================================
+// YOLO Ops (Task 005)
+// =============================================================================
+
+// --- Sigmoid ---
+struct SigmoidBuilder;
+static SIGMOID_BUILDER: SigmoidBuilder = SigmoidBuilder;
+
+impl OpBuilder for SigmoidBuilder {
+    fn op_type(&self) -> &'static str { "Sigmoid" }
+
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.len() != 1 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "1",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
+        Ok(input_shape.clone())
+    }
+
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let output_shape = self.validate(node, ctx)?;
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Sigmoid".into(),
+            inputs: node.inputs.clone(),
+            outputs: node.outputs.clone(),
+            params: OpParams::Sigmoid,
+        })
+    }
+}
+
+// --- Mul ---
+struct MulBuilder;
+static MUL_BUILDER: MulBuilder = MulBuilder;
+
+impl OpBuilder for MulBuilder {
+    fn op_type(&self) -> &'static str { "Mul" }
+
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.len() != 2 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "2",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let a_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
+        // For now, assume both inputs have the same shape (broadcasting handled at runtime)
+        Ok(a_shape.clone())
+    }
+
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let output_shape = self.validate(node, ctx)?;
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Mul".into(),
+            inputs: node.inputs.clone(),
+            outputs: node.outputs.clone(),
+            params: OpParams::Mul,
+        })
+    }
+}
+
+// --- Resize ---
+struct ResizeBuilder;
+static RESIZE_BUILDER: ResizeBuilder = ResizeBuilder;
+
+impl OpBuilder for ResizeBuilder {
+    fn op_type(&self) -> &'static str { "Resize" }
+
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        // Resize has multiple inputs: X, roi (optional), scales (optional), sizes (optional)
+        if node.inputs.is_empty() || node.inputs.len() > 4 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "1-4",
+            });
+        }
+        
+        // Check mode - we support nearest and linear
+        let mode = node.get_attr_string("mode", "nearest");
+        if mode != "nearest" && mode != "linear" {
+            return Err(UnsupportedReason::UnsupportedAttribute {
+                name: "mode".into(),
+                value: mode,
+                reason: "only 'nearest' and 'linear' modes supported".into(),
+            });
+        }
+        
+        Ok(())
+    }
+
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
+        
+        if input_shape.dims.len() != 4 {
+            return Err(Error::Validation("Resize input must be 4D (NCHW)".into()));
+        }
+        
+        // Get output size from 'sizes' input (index 3) or 'scales' input (index 2)
+        let (out_h, out_w) = if node.inputs.len() > 3 && !node.inputs[3].is_empty() {
+            // sizes input
+            if let Some(sizes_data) = ctx.get_constant_data(&node.inputs[3]) {
+                let sizes: &[i64] = unsafe {
+                    std::slice::from_raw_parts(sizes_data.as_ptr() as *const i64, sizes_data.len() / 8)
+                };
+                if sizes.len() >= 4 {
+                    (sizes[2] as usize, sizes[3] as usize)
+                } else {
+                    return Err(Error::Validation("Resize sizes must have 4 elements".into()));
+                }
+            } else {
+                return Err(Error::Validation("Resize sizes must be constant".into()));
+            }
+        } else if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
+            // scales input
+            if let Some(scales_data) = ctx.get_constant_data(&node.inputs[2]) {
+                let scales: &[f32] = unsafe {
+                    std::slice::from_raw_parts(scales_data.as_ptr() as *const f32, scales_data.len() / 4)
+                };
+                if scales.len() >= 4 {
+                    let h = (input_shape.dims[2] as f32 * scales[2]).round() as usize;
+                    let w = (input_shape.dims[3] as f32 * scales[3]).round() as usize;
+                    (h, w)
+                } else {
+                    return Err(Error::Validation("Resize scales must have 4 elements".into()));
+                }
+            } else {
+                return Err(Error::Validation("Resize scales must be constant".into()));
+            }
+        } else {
+            return Err(Error::Validation("Resize requires either scales or sizes".into()));
+        };
+        
+        let out_shape = vec![input_shape.dims[0], input_shape.dims[1], out_h, out_w];
+        Ok(TensorShape::new(out_shape, input_shape.dtype))
+    }
+
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let output_shape = self.validate(node, ctx)?;
+        let out_h = output_shape.dims[2];
+        let out_w = output_shape.dims[3];
+        let mode = node.get_attr_string("mode", "nearest");
+        
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Resize".into(),
+            inputs: vec![node.inputs[0].clone()], // Only pass data input
+            outputs: node.outputs.clone(),
+            params: OpParams::Resize { out_h, out_w, mode },
+        })
+    }
+}
+
+// --- Split ---
+struct SplitBuilder;
+static SPLIT_BUILDER: SplitBuilder = SplitBuilder;
+
+impl OpBuilder for SplitBuilder {
+    fn op_type(&self) -> &'static str { "Split" }
+
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.is_empty() || node.inputs.len() > 2 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "1-2",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
+        
+        let axis = {
+            let a = node.get_attr_int("axis", 0);
+            if a < 0 { (input_shape.dims.len() as i64 + a) as usize } else { a as usize }
+        };
+        
+        // Get split sizes from attribute or input
+        let split_sizes: Vec<usize> = if node.inputs.len() > 1 && !node.inputs[1].is_empty() {
+            if let Some(split_data) = ctx.get_constant_data(&node.inputs[1]) {
+                let splits: &[i64] = unsafe {
+                    std::slice::from_raw_parts(split_data.as_ptr() as *const i64, split_data.len() / 8)
+                };
+                splits.iter().map(|&s| s as usize).collect()
+            } else {
+                return Err(Error::Validation("Split sizes must be constant".into()));
+            }
+        } else {
+            // Use num_outputs attribute or split evenly
+            let attr_splits = node.get_attr_ints("split");
+            if !attr_splits.is_empty() {
+                attr_splits.iter().map(|&s| s as usize).collect()
+            } else {
+                let num_outputs = node.outputs.len();
+                let size = input_shape.dims[axis] / num_outputs;
+                vec![size; num_outputs]
+            }
+        };
+        
+        // Return first output shape
+        let mut out_shape = input_shape.dims.clone();
+        out_shape[axis] = split_sizes[0];
+        
+        Ok(TensorShape::new(out_shape, input_shape.dtype))
+    }
+
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?
+            .clone();
+        
+        let axis = {
+            let a = node.get_attr_int("axis", 0);
+            if a < 0 { (input_shape.dims.len() as i64 + a) as usize } else { a as usize }
+        };
+        
+        let split_sizes: Vec<usize> = if node.inputs.len() > 1 && !node.inputs[1].is_empty() {
+            if let Some(split_data) = ctx.get_constant_data(&node.inputs[1]) {
+                let splits: &[i64] = unsafe {
+                    std::slice::from_raw_parts(split_data.as_ptr() as *const i64, split_data.len() / 8)
+                };
+                splits.iter().map(|&s| s as usize).collect()
+            } else {
+                return Err(Error::Validation("Split sizes must be constant".into()));
+            }
+        } else {
+            let attr_splits = node.get_attr_ints("split");
+            if !attr_splits.is_empty() {
+                attr_splits.iter().map(|&s| s as usize).collect()
+            } else {
+                let num_outputs = node.outputs.len();
+                let size = input_shape.dims[axis] / num_outputs;
+                vec![size; num_outputs]
+            }
+        };
+        
+        // Set shapes for all outputs
+        for (i, (output_name, &split_size)) in node.outputs.iter().zip(split_sizes.iter()).enumerate() {
+            let mut out_shape = input_shape.dims.clone();
+            out_shape[axis] = split_size;
+            ctx.set_shape(output_name.clone(), TensorShape::new(out_shape, input_shape.dtype));
+            
+            // Only set first output in validate
+            if i == 0 {
+                continue;
+            }
+        }
+        
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Split".into(),
+            inputs: vec![node.inputs[0].clone()],
+            outputs: node.outputs.clone(),
+            params: OpParams::Split { axis, split_sizes },
+        })
+    }
+}
+
+// --- Slice ---
+struct SliceBuilder;
+static SLICE_BUILDER: SliceBuilder = SliceBuilder;
+
+impl OpBuilder for SliceBuilder {
+    fn op_type(&self) -> &'static str { "Slice" }
+
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        // Slice inputs: data, starts, ends, axes (optional), steps (optional)
+        if node.inputs.len() < 3 || node.inputs.len() > 5 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "3-5",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
+        
+        // Get starts, ends, axes, steps from constant inputs
+        let starts: Vec<i64> = get_i64_constant(ctx, &node.inputs[1])?;
+        let ends: Vec<i64> = get_i64_constant(ctx, &node.inputs[2])?;
+        
+        let axes: Vec<usize> = if node.inputs.len() > 3 && !node.inputs[3].is_empty() {
+            get_i64_constant(ctx, &node.inputs[3])?.iter().map(|&a| {
+                if a < 0 { (input_shape.dims.len() as i64 + a) as usize } else { a as usize }
+            }).collect()
+        } else {
+            (0..starts.len()).collect()
+        };
+        
+        let steps: Vec<i64> = if node.inputs.len() > 4 && !node.inputs[4].is_empty() {
+            get_i64_constant(ctx, &node.inputs[4])?
+        } else {
+            vec![1; starts.len()]
+        };
+        
+        // Calculate output shape
+        let mut out_dims = input_shape.dims.clone();
+        for (i, &axis) in axes.iter().enumerate() {
+            let dim = input_shape.dims[axis] as i64;
+            let s = starts[i];
+            let e = ends[i];
+            let start = if s < 0 { (dim + s).max(0) } else { s.min(dim) } as usize;
+            let end = if e < 0 { (dim + e).max(0) } else { e.min(dim) } as usize;
+            let step = steps[i].unsigned_abs() as usize;
+            out_dims[axis] = (end.saturating_sub(start) + step - 1) / step;
+        }
+        
+        Ok(TensorShape::new(out_dims, input_shape.dtype))
+    }
+
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let input_shape = ctx.get_shape(&node.inputs[0]).unwrap().clone();
+        let output_shape = self.validate(node, ctx)?;
+        
+        let starts: Vec<isize> = get_i64_constant(ctx, &node.inputs[1])?.iter().map(|&s| s as isize).collect();
+        let ends: Vec<isize> = get_i64_constant(ctx, &node.inputs[2])?.iter().map(|&e| e as isize).collect();
+        
+        let axes: Vec<usize> = if node.inputs.len() > 3 && !node.inputs[3].is_empty() {
+            get_i64_constant(ctx, &node.inputs[3])?.iter().map(|&a| {
+                if a < 0 { (input_shape.dims.len() as i64 + a) as usize } else { a as usize }
+            }).collect()
+        } else {
+            (0..starts.len()).collect()
+        };
+        
+        let steps: Vec<isize> = if node.inputs.len() > 4 && !node.inputs[4].is_empty() {
+            get_i64_constant(ctx, &node.inputs[4])?.iter().map(|&s| s as isize).collect()
+        } else {
+            vec![1; starts.len()]
+        };
+        
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Slice".into(),
+            inputs: vec![node.inputs[0].clone()],
+            outputs: node.outputs.clone(),
+            params: OpParams::Slice { starts, ends, axes, steps },
+        })
+    }
+}
+
+/// Helper to extract i64 constant data
+fn get_i64_constant(ctx: &BuildContext<'_>, name: &str) -> Result<Vec<i64>> {
+    let data = ctx.get_constant_data(name)
+        .ok_or_else(|| Error::Validation(format!("Slice: {} must be constant", name)))?;
+    Ok(unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const i64, data.len() / 8).to_vec()
+    })
 }
