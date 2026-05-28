@@ -19,3 +19,4 @@ serde = ["dep:serde"]
 
 [dependencies]
 serde = { workspace = true, optional = true }
+libm = "0.2"

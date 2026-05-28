@@ -41,6 +41,19 @@ pub enum Dtype {
     F32,
     /// 16-bit IEEE 754 half-precision floating point.
     F16,
+    /// 8-bit signed integer for quantized inference.
+    ///
+    /// INT8 quantization uses symmetric quantization with scale:
+    /// ```text
+    /// x_float = x_int8 * scale
+    /// ```
+    /// The zero point is always 0 for symmetric quantization.
+    I8,
+    /// 32-bit signed integer for accumulation in quantized inference.
+    ///
+    /// Used as the accumulator type for INT8 convolutions and GEMM.
+    /// After accumulation, results are requantized back to I8.
+    I32,
 }
 
 impl Dtype {
@@ -50,7 +63,21 @@ impl Dtype {
         match self {
             Dtype::F32 => 4,
             Dtype::F16 => 2,
+            Dtype::I8 => 1,
+            Dtype::I32 => 4,
         }
+    }
+
+    /// Returns `true` if this dtype is a quantized integer type.
+    #[must_use]
+    pub const fn is_quantized(self) -> bool {
+        matches!(self, Dtype::I8)
+    }
+
+    /// Returns `true` if this dtype is a floating-point type.
+    #[must_use]
+    pub const fn is_float(self) -> bool {
+        matches!(self, Dtype::F32 | Dtype::F16)
     }
 }
 
@@ -59,6 +86,8 @@ impl fmt::Display for Dtype {
         match self {
             Dtype::F32 => write!(f, "f32"),
             Dtype::F16 => write!(f, "f16"),
+            Dtype::I8 => write!(f, "i8"),
+            Dtype::I32 => write!(f, "i32"),
         }
     }
 }
@@ -410,5 +439,31 @@ mod tests {
     fn dtype_size() {
         assert_eq!(Dtype::F32.size_bytes(), 4);
         assert_eq!(Dtype::F16.size_bytes(), 2);
+        assert_eq!(Dtype::I8.size_bytes(), 1);
+        assert_eq!(Dtype::I32.size_bytes(), 4);
+    }
+
+    #[test]
+    fn dtype_is_quantized() {
+        assert!(!Dtype::F32.is_quantized());
+        assert!(!Dtype::F16.is_quantized());
+        assert!(Dtype::I8.is_quantized());
+        assert!(!Dtype::I32.is_quantized());
+    }
+
+    #[test]
+    fn dtype_is_float() {
+        assert!(Dtype::F32.is_float());
+        assert!(Dtype::F16.is_float());
+        assert!(!Dtype::I8.is_float());
+        assert!(!Dtype::I32.is_float());
+    }
+
+    #[test]
+    fn dtype_display() {
+        assert_eq!(format!("{}", Dtype::F32), "f32");
+        assert_eq!(format!("{}", Dtype::F16), "f16");
+        assert_eq!(format!("{}", Dtype::I8), "i8");
+        assert_eq!(format!("{}", Dtype::I32), "i32");
     }
 }
