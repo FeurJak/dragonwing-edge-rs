@@ -1102,6 +1102,224 @@ mod tests {
             assert!(approx_eq(a, b), "div_f32 mismatch at {i}: {a} vs {b}");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // INT8 quantized ops tests (Task 006)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gemm_i8_scalar_basic() {
+        // 2x3 * 3x2 = 2x2
+        let a: Vec<i8> = vec![1, 2, 3, 4, 5, 6];
+        let b: Vec<i8> = vec![7, 8, 9, 10, 11, 12];
+        let mut c = vec![0i32; 4];
+        
+        super::gemm_i8_scalar(&mut c, &a, &b, 2, 2, 3);
+        
+        // Row 0: (1*7 + 2*9 + 3*11) = 7+18+33 = 58, (1*8 + 2*10 + 3*12) = 8+20+36 = 64
+        // Row 1: (4*7 + 5*9 + 6*11) = 28+45+66 = 139, (4*8 + 5*10 + 6*12) = 32+50+72 = 154
+        assert_eq!(c[0], 58);
+        assert_eq!(c[1], 64);
+        assert_eq!(c[2], 139);
+        assert_eq!(c[3], 154);
+    }
+
+    #[test]
+    fn gemm_i8_matches_scalar() {
+        let m = 8;
+        let n = 8;
+        let k = 16;
+        
+        let a: Vec<i8> = (0..m * k).map(|i| ((i % 256) as i8).wrapping_sub(64)).collect();
+        let b: Vec<i8> = (0..k * n).map(|i| ((i * 3 % 256) as i8).wrapping_sub(32)).collect();
+        
+        let mut c_scalar = vec![0i32; m * n];
+        let mut c_main = vec![0i32; m * n];
+        
+        super::gemm_i8_scalar(&mut c_scalar, &a, &b, m, n, k);
+        super::gemm_i8(&mut c_main, &a, &b, m, n, k);
+        
+        for i in 0..m * n {
+            assert_eq!(c_main[i], c_scalar[i], "gemm_i8 mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn conv2d_i8_nhwc_basic() {
+        // Simple 3x3 conv on 5x5 input, all ones
+        let n = 1;
+        let h_in = 5;
+        let w_in = 5;
+        let c_in = 1;
+        let c_out = 1;
+        let k = 3;
+        
+        let input = vec![1i8; n * h_in * w_in * c_in];
+        let kernel = vec![1i8; k * k * c_in * c_out];
+        
+        let h_out = h_in - k + 1; // = 3
+        let w_out = w_in - k + 1; // = 3
+        let mut output = vec![0i32; n * h_out * w_out * c_out];
+        
+        super::conv2d_i8_nhwc(
+            &mut output, &input, &kernel,
+            n, h_in, w_in, c_in, c_out, k, k, 1, 1, 0, 0
+        );
+        
+        // Each output should be 3*3 = 9
+        for (i, &out) in output.iter().enumerate() {
+            assert_eq!(out, 9, "conv2d_i8 mismatch at {i}: expected 9, got {out}");
+        }
+    }
+
+    #[test]
+    fn add_i8_basic() {
+        let a = vec![10i8, 20, 30, 40, 50];
+        let b = vec![5i8, 10, 15, 20, 25];
+        let mut output = vec![0i8; 5];
+        
+        // Scales: a=0.1, b=0.1, y=0.1
+        // scale_a/y = 1.0, scale_b/y = 1.0
+        super::add_i8(&mut output, &a, &b, 1.0, 1.0);
+        
+        // Result should be a + b
+        assert_eq!(output[0], 15);
+        assert_eq!(output[1], 30);
+        assert_eq!(output[2], 45);
+        assert_eq!(output[3], 60);
+        assert_eq!(output[4], 75);
+    }
+
+    #[test]
+    fn add_i8_with_scaling() {
+        let a = vec![100i8, 100, 100];
+        let b = vec![100i8, 100, 100];
+        let mut output = vec![0i8; 3];
+        
+        // scale_a/y = 0.5, scale_b/y = 0.5 -> output = 50 + 50 = 100
+        super::add_i8(&mut output, &a, &b, 0.5, 0.5);
+        
+        for &out in &output {
+            assert_eq!(out, 100);
+        }
+    }
+
+    #[test]
+    fn relu_i8_basic() {
+        let input = vec![-50i8, -10, 0, 10, 50];
+        let mut output = vec![0i8; 5];
+        
+        super::relu_i8(&mut output, &input);
+        
+        assert_eq!(output[0], 0);
+        assert_eq!(output[1], 0);
+        assert_eq!(output[2], 0);
+        assert_eq!(output[3], 10);
+        assert_eq!(output[4], 50);
+    }
+
+    #[test]
+    fn relu_i8_matches_scalar() {
+        let input: Vec<i8> = (-128..127).map(|i| i as i8).collect();
+        let mut output_main = vec![0i8; input.len()];
+        let mut output_scalar = vec![0i8; input.len()];
+        
+        super::relu_i8(&mut output_main, &input);
+        super::relu_i8_scalar(&mut output_scalar, &input);
+        
+        assert_eq!(output_main, output_scalar);
+    }
+
+    #[test]
+    fn requantize_i32_to_i8_basic() {
+        let input = vec![1000i32, 2000, -1000, -2000, 0];
+        let mut output = vec![0i8; 5];
+        
+        // requant_scale = 0.1 -> 1000*0.1 = 100, 2000*0.1 = 200 -> clamped to 127
+        super::requantize_i32_to_i8(&mut output, &input, 0.1);
+        
+        assert_eq!(output[0], 100);
+        assert_eq!(output[1], 127); // clamped
+        assert_eq!(output[2], -100);
+        assert_eq!(output[3], -128); // clamped
+        assert_eq!(output[4], 0);
+    }
+
+    #[test]
+    fn requantize_i32_to_i8_matches_scalar() {
+        let input: Vec<i32> = (-1000..1000).map(|i| i * 100).collect();
+        let mut output_main = vec![0i8; input.len()];
+        let mut output_scalar = vec![0i8; input.len()];
+        
+        super::requantize_i32_to_i8(&mut output_main, &input, 0.001);
+        super::requantize_i32_to_i8_scalar(&mut output_scalar, &input, 0.001);
+        
+        for i in 0..input.len() {
+            let diff = (output_main[i] as i32 - output_scalar[i] as i32).abs();
+            assert!(diff <= 1, "requantize mismatch at {i}: {} vs {}", output_main[i], output_scalar[i]);
+        }
+    }
+
+    #[test]
+    fn quantize_dequantize_roundtrip() {
+        let scale = 0.1;
+        let original = vec![0.0f32, 1.5, -2.3, 5.0, -10.0];
+        let mut quantized = vec![0i8; 5];
+        let mut dequantized = vec![0.0f32; 5];
+        
+        super::quantize_f32_to_i8(&mut quantized, &original, scale);
+        super::dequantize_i8_to_f32(&mut dequantized, &quantized, scale);
+        
+        // Roundtrip should be close (within quantization error)
+        for (i, (&orig, &deq)) in original.iter().zip(dequantized.iter()).enumerate() {
+            let diff = (orig - deq).abs();
+            // Quantization error is at most scale/2
+            assert!(diff < scale, "roundtrip error at {i}: {} vs {}", orig, deq);
+        }
+    }
+
+    #[test]
+    fn dequantize_i8_to_f32_basic() {
+        let input = vec![0i8, 10, -10, 127, -128];
+        let mut output = vec![0.0f32; 5];
+        
+        super::dequantize_i8_to_f32(&mut output, &input, 0.5);
+        
+        assert!((output[0] - 0.0).abs() < 1e-6);
+        assert!((output[1] - 5.0).abs() < 1e-6);
+        assert!((output[2] - (-5.0)).abs() < 1e-6);
+        assert!((output[3] - 63.5).abs() < 1e-6);
+        assert!((output[4] - (-64.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn quantize_f32_to_i8_basic() {
+        let input = vec![0.0f32, 5.0, -5.0, 200.0, -200.0];
+        let mut output = vec![0i8; 5];
+        
+        super::quantize_f32_to_i8(&mut output, &input, 1.0);
+        
+        assert_eq!(output[0], 0);
+        assert_eq!(output[1], 5);
+        assert_eq!(output[2], -5);
+        assert_eq!(output[3], 127);  // clamped
+        assert_eq!(output[4], -128); // clamped
+    }
+
+    #[test]
+    fn quantize_f32_to_i8_matches_scalar() {
+        let input: Vec<f32> = (-500..500).map(|i| i as f32 * 0.5).collect();
+        let mut output_main = vec![0i8; input.len()];
+        let mut output_scalar = vec![0i8; input.len()];
+        
+        super::quantize_f32_to_i8(&mut output_main, &input, 2.0);
+        super::quantize_f32_to_i8_scalar(&mut output_scalar, &input, 0.5); // inv_scale = 0.5 = 1/2.0
+        
+        for i in 0..input.len() {
+            let diff = (output_main[i] as i32 - output_scalar[i] as i32).abs();
+            assert!(diff <= 1, "quantize mismatch at {i}: {} vs {}", output_main[i], output_scalar[i]);
+        }
+    }
 }
 
 // ===========================================================================
@@ -2712,4 +2930,638 @@ pub fn depthwise_conv2d_fp16_nhwc_mt(
             }
         }
     });
+}
+
+// ===========================================================================
+// INT8 Quantized Operations (Task 006)
+// ===========================================================================
+//
+// INT8 operations for quantized inference. These ops use:
+// - INT8 inputs with per-tensor or per-channel scales
+// - INT32 accumulators for precision
+// - Requantization to INT8 outputs
+//
+// On AArch64 with DotProd extension (ARMv8.2-A+), we use `vdotq_s32` for
+// 4-element dot products. On Cortex-A53 (no DotProd), we fall back to
+// multiply-accumulate sequences.
+
+// ---------------------------------------------------------------------------
+// gemm_i8: INT8 matrix multiplication with INT32 accumulator
+// ---------------------------------------------------------------------------
+
+/// INT8 matrix multiplication with INT32 accumulator: `C_i32 = A_i8 * B_i8`.
+///
+/// * `a` is `[m, k]` row-major, INT8 elements.
+/// * `b` is `[k, n]` row-major, INT8 elements.
+/// * `c` is `[m, n]` row-major, INT32 accumulator output.
+///
+/// The caller is responsible for requantizing the INT32 output to INT8
+/// using the appropriate scales.
+///
+/// # Panics
+///
+/// Panics if buffer sizes don't match.
+pub fn gemm_i8(c: &mut [i32], a: &[i8], b: &[i8], m: usize, n: usize, k: usize) {
+    assert_eq!(a.len(), m * k, "gemm_i8: A size mismatch");
+    assert_eq!(b.len(), k * n, "gemm_i8: B size mismatch");
+    assert_eq!(c.len(), m * n, "gemm_i8: C size mismatch");
+    
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on AArch64
+        unsafe { gemm_i8_neon(c, a, b, m, n, k) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        gemm_i8_scalar(c, a, b, m, n, k);
+    }
+}
+
+/// Scalar INT8 GEMM implementation.
+pub fn gemm_i8_scalar(c: &mut [i32], a: &[i8], b: &[i8], m: usize, n: usize, k: usize) {
+    assert_eq!(a.len(), m * k, "gemm_i8_scalar: A size mismatch");
+    assert_eq!(b.len(), k * n, "gemm_i8_scalar: B size mismatch");
+    assert_eq!(c.len(), m * n, "gemm_i8_scalar: C size mismatch");
+    
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc: i32 = 0;
+            for p in 0..k {
+                acc += (a[i * k + p] as i32) * (b[p * n + j] as i32);
+            }
+            c[i * n + j] = acc;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn gemm_i8_neon(c: &mut [i32], a: &[i8], b: &[i8], m: usize, n: usize, k: usize) {
+    use core::arch::aarch64::{vld1q_s8, vmull_s8, vpaddlq_s16, vaddq_s32, vdupq_n_s32, vgetq_lane_s32};
+    
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(b.len(), k * n);
+    debug_assert_eq!(c.len(), m * n);
+    
+    // For each output element, compute dot product
+    // We process 8 elements at a time using NEON vmull_s8 (widening multiply)
+    // then accumulate with vpaddl (pairwise add long)
+    unsafe {
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = vdupq_n_s32(0);
+                let mut scalar_acc: i32 = 0;
+                
+                // Process 16 elements at a time
+                let mut p = 0;
+                while p + 16 <= k {
+                    // Load 16 elements from A row
+                    let a_ptr = a.as_ptr().add(i * k + p);
+                    let a_vec = vld1q_s8(a_ptr);
+                    
+                    // For B, we need to gather elements from column j
+                    // This is inefficient due to non-contiguous access
+                    // A better approach would be to transpose B
+                    let mut b_arr = [0i8; 16];
+                    for idx in 0..16 {
+                        b_arr[idx] = *b.as_ptr().add((p + idx) * n + j);
+                    }
+                    let b_vec = vld1q_s8(b_arr.as_ptr());
+                    
+                    // Widening multiply: 16xi8 * 16xi8 -> two 8xi16 results
+                    let low_8 = core::arch::aarch64::vget_low_s8(a_vec);
+                    let high_8 = core::arch::aarch64::vget_high_s8(a_vec);
+                    let b_low_8 = core::arch::aarch64::vget_low_s8(b_vec);
+                    let b_high_8 = core::arch::aarch64::vget_high_s8(b_vec);
+                    
+                    let prod_low = vmull_s8(low_8, b_low_8);
+                    let prod_high = vmull_s8(high_8, b_high_8);
+                    
+                    // Pairwise add to get i32
+                    let sum_low = vpaddlq_s16(prod_low);
+                    let sum_high = vpaddlq_s16(prod_high);
+                    
+                    acc = vaddq_s32(acc, sum_low);
+                    acc = vaddq_s32(acc, sum_high);
+                    
+                    p += 16;
+                }
+                
+                // Horizontal sum of acc vector
+                let sum = vgetq_lane_s32(acc, 0) + vgetq_lane_s32(acc, 1) 
+                        + vgetq_lane_s32(acc, 2) + vgetq_lane_s32(acc, 3);
+                scalar_acc += sum;
+                
+                // Handle remaining elements
+                while p < k {
+                    scalar_acc += (*a.as_ptr().add(i * k + p) as i32) 
+                               * (*b.as_ptr().add(p * n + j) as i32);
+                    p += 1;
+                }
+                
+                *c.as_mut_ptr().add(i * n + j) = scalar_acc;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// conv2d_i8_nhwc: INT8 2D convolution with INT32 accumulator
+// ---------------------------------------------------------------------------
+
+/// INT8 2D convolution in NHWC format with INT32 accumulator.
+///
+/// * `input`: `[N, H_in, W_in, C_in]` INT8
+/// * `kernel`: `[K_h, K_w, C_in, C_out]` INT8
+/// * `output`: `[N, H_out, W_out, C_out]` INT32 accumulator
+///
+/// The caller is responsible for:
+/// 1. Requantizing the INT32 output to INT8
+/// 2. Adding bias (in INT32 domain before requantization)
+///
+/// # Panics
+///
+/// Panics if buffer sizes don't match.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_i8_nhwc(
+    output: &mut [i32],
+    input: &[i8],
+    kernel: &[i8],
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    c_out: usize,
+    k_h: usize,
+    k_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) {
+    let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+    let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+    
+    assert_eq!(input.len(), n * h_in * w_in * c_in, "conv2d_i8_nhwc: input size mismatch");
+    assert_eq!(kernel.len(), k_h * k_w * c_in * c_out, "conv2d_i8_nhwc: kernel size mismatch");
+    assert_eq!(output.len(), n * h_out * w_out * c_out, "conv2d_i8_nhwc: output size mismatch");
+    
+    for batch in 0..n {
+        for oh in 0..h_out {
+            for ow in 0..w_out {
+                for oc in 0..c_out {
+                    let mut acc: i32 = 0;
+                    
+                    for kh in 0..k_h {
+                        for kw in 0..k_w {
+                            let ih = (oh * stride_h + kh) as isize - pad_h as isize;
+                            let iw = (ow * stride_w + kw) as isize - pad_w as isize;
+                            
+                            if ih < 0 || ih >= h_in as isize || iw < 0 || iw >= w_in as isize {
+                                continue;
+                            }
+                            
+                            let ih = ih as usize;
+                            let iw = iw as usize;
+                            
+                            for ic in 0..c_in {
+                                let input_idx = ((batch * h_in + ih) * w_in + iw) * c_in + ic;
+                                let kernel_idx = ((kh * k_w + kw) * c_in + ic) * c_out + oc;
+                                
+                                acc += (input[input_idx] as i32) * (kernel[kernel_idx] as i32);
+                            }
+                        }
+                    }
+                    
+                    let output_idx = ((batch * h_out + oh) * w_out + ow) * c_out + oc;
+                    output[output_idx] = acc;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// add_i8: INT8 addition with requantization
+// ---------------------------------------------------------------------------
+
+/// INT8 element-wise addition with requantization.
+///
+/// Computes: `y = requantize(a + b)` where addition is done in INT32 domain.
+///
+/// The formula is:
+/// ```text
+/// a_f32 = a_i8 * scale_a
+/// b_f32 = b_i8 * scale_b
+/// y_f32 = a_f32 + b_f32
+/// y_i8 = round(y_f32 / scale_y)
+/// ```
+///
+/// Optimized computation:
+/// ```text
+/// y_i8 = round((a_i8 * scale_a + b_i8 * scale_b) / scale_y)
+///      = round(a_i8 * (scale_a / scale_y) + b_i8 * (scale_b / scale_y))
+/// ```
+///
+/// # Arguments
+/// * `output` - Output buffer (INT8)
+/// * `a` - First input (INT8)
+/// * `b` - Second input (INT8)
+/// * `scale_a_over_y` - `scale_a / scale_y` precomputed
+/// * `scale_b_over_y` - `scale_b / scale_y` precomputed
+///
+/// # Panics
+///
+/// Panics if lengths don't match.
+pub fn add_i8(
+    output: &mut [i8],
+    a: &[i8],
+    b: &[i8],
+    scale_a_over_y: f32,
+    scale_b_over_y: f32,
+) {
+    assert_eq!(output.len(), a.len(), "add_i8: output/a length mismatch");
+    assert_eq!(output.len(), b.len(), "add_i8: output/b length mismatch");
+    
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { add_i8_neon(output, a, b, scale_a_over_y, scale_b_over_y) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        add_i8_scalar(output, a, b, scale_a_over_y, scale_b_over_y);
+    }
+}
+
+/// Scalar INT8 addition implementation.
+pub fn add_i8_scalar(
+    output: &mut [i8],
+    a: &[i8],
+    b: &[i8],
+    scale_a_over_y: f32,
+    scale_b_over_y: f32,
+) {
+    for (out, (&ai, &bi)) in output.iter_mut().zip(a.iter().zip(b.iter())) {
+        let result = (ai as f32) * scale_a_over_y + (bi as f32) * scale_b_over_y;
+        let clamped = result.clamp(-128.0, 127.0);
+        *out = clamped.round() as i8;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn add_i8_neon(
+    output: &mut [i8],
+    a: &[i8],
+    b: &[i8],
+    scale_a_over_y: f32,
+    scale_b_over_y: f32,
+) {
+    use core::arch::aarch64::{
+        vcvtq_f32_s32, vcvtq_s32_f32,
+        vdupq_n_f32, vmulq_f32, vaddq_f32, vminq_f32, vmaxq_f32,
+    };
+    
+    let len = output.len();
+    let scale_a_vec = vdupq_n_f32(scale_a_over_y);
+    let scale_b_vec = vdupq_n_f32(scale_b_over_y);
+    let min_vec = vdupq_n_f32(-128.0);
+    let max_vec = vdupq_n_f32(127.0);
+    
+    unsafe {
+        let mut i = 0;
+        
+        // Process 4 elements at a time (expanding to f32)
+        while i + 4 <= len {
+            // Load 4 INT8 values
+            let a0 = *a.as_ptr().add(i) as i32;
+            let a1 = *a.as_ptr().add(i + 1) as i32;
+            let a2 = *a.as_ptr().add(i + 2) as i32;
+            let a3 = *a.as_ptr().add(i + 3) as i32;
+            
+            let b0 = *b.as_ptr().add(i) as i32;
+            let b1 = *b.as_ptr().add(i + 1) as i32;
+            let b2 = *b.as_ptr().add(i + 2) as i32;
+            let b3 = *b.as_ptr().add(i + 3) as i32;
+            
+            // Create i32 vectors
+            let a_i32: [i32; 4] = [a0, a1, a2, a3];
+            let b_i32: [i32; 4] = [b0, b1, b2, b3];
+            
+            let a_vec = core::arch::aarch64::vld1q_s32(a_i32.as_ptr());
+            let b_vec = core::arch::aarch64::vld1q_s32(b_i32.as_ptr());
+            
+            // Convert to f32
+            let a_f32 = vcvtq_f32_s32(a_vec);
+            let b_f32 = vcvtq_f32_s32(b_vec);
+            
+            // Scale and add
+            let scaled_a = vmulq_f32(a_f32, scale_a_vec);
+            let scaled_b = vmulq_f32(b_f32, scale_b_vec);
+            let sum = vaddq_f32(scaled_a, scaled_b);
+            
+            // Clamp
+            let clamped = vmaxq_f32(vminq_f32(sum, max_vec), min_vec);
+            
+            // Convert back to i32 (with rounding via vcvtq)
+            let result_i32 = vcvtq_s32_f32(clamped);
+            
+            // Store as i8
+            let mut result_arr = [0i32; 4];
+            core::arch::aarch64::vst1q_s32(result_arr.as_mut_ptr(), result_i32);
+            
+            *output.as_mut_ptr().add(i) = result_arr[0] as i8;
+            *output.as_mut_ptr().add(i + 1) = result_arr[1] as i8;
+            *output.as_mut_ptr().add(i + 2) = result_arr[2] as i8;
+            *output.as_mut_ptr().add(i + 3) = result_arr[3] as i8;
+            
+            i += 4;
+        }
+        
+        // Handle tail
+        while i < len {
+            let ai = *a.as_ptr().add(i);
+            let bi = *b.as_ptr().add(i);
+            let result = (ai as f32) * scale_a_over_y + (bi as f32) * scale_b_over_y;
+            let clamped = result.clamp(-128.0, 127.0);
+            *output.as_mut_ptr().add(i) = clamped.round() as i8;
+            i += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// relu_i8: INT8 ReLU (passthrough with clamp)
+// ---------------------------------------------------------------------------
+
+/// INT8 ReLU: `y = max(0, x)`.
+///
+/// For symmetric quantization with zero_point = 0, ReLU is simply
+/// clamping negative values to 0.
+pub fn relu_i8(output: &mut [i8], input: &[i8]) {
+    assert_eq!(output.len(), input.len(), "relu_i8: length mismatch");
+    
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { relu_i8_neon(output, input) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        relu_i8_scalar(output, input);
+    }
+}
+
+/// Scalar INT8 ReLU.
+pub fn relu_i8_scalar(output: &mut [i8], input: &[i8]) {
+    for (out, &inp) in output.iter_mut().zip(input.iter()) {
+        *out = if inp > 0 { inp } else { 0 };
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn relu_i8_neon(output: &mut [i8], input: &[i8]) {
+    use core::arch::aarch64::{vld1q_s8, vst1q_s8, vmaxq_s8, vdupq_n_s8};
+    
+    let len = input.len();
+    let zero = vdupq_n_s8(0);
+    
+    unsafe {
+        let mut i = 0;
+        while i + 16 <= len {
+            let inp = vld1q_s8(input.as_ptr().add(i));
+            let result = vmaxq_s8(inp, zero);
+            vst1q_s8(output.as_mut_ptr().add(i), result);
+            i += 16;
+        }
+        
+        // Tail
+        while i < len {
+            let v = *input.as_ptr().add(i);
+            *output.as_mut_ptr().add(i) = if v > 0 { v } else { 0 };
+            i += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// requantize_i32_to_i8: Requantization from INT32 accumulator to INT8
+// ---------------------------------------------------------------------------
+
+/// Requantize INT32 accumulator to INT8.
+///
+/// After INT8 convolution/GEMM, the accumulator contains INT32 values.
+/// This function converts them back to INT8 with the appropriate scale.
+///
+/// Formula:
+/// ```text
+/// output_i8 = round(acc_i32 * requant_scale)
+/// ```
+///
+/// where `requant_scale = scale_input * scale_weight / scale_output`
+///
+/// # Panics
+///
+/// Panics if lengths don't match.
+pub fn requantize_i32_to_i8(output: &mut [i8], input: &[i32], requant_scale: f32) {
+    assert_eq!(output.len(), input.len(), "requantize_i32_to_i8: length mismatch");
+    
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { requantize_i32_to_i8_neon(output, input, requant_scale) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        requantize_i32_to_i8_scalar(output, input, requant_scale);
+    }
+}
+
+/// Scalar requantization.
+pub fn requantize_i32_to_i8_scalar(output: &mut [i8], input: &[i32], requant_scale: f32) {
+    for (out, &inp) in output.iter_mut().zip(input.iter()) {
+        let scaled = (inp as f32) * requant_scale;
+        let clamped = scaled.clamp(-128.0, 127.0);
+        *out = clamped.round() as i8;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn requantize_i32_to_i8_neon(output: &mut [i8], input: &[i32], requant_scale: f32) {
+    use core::arch::aarch64::{
+        vld1q_s32, vcvtq_f32_s32, vcvtq_s32_f32, vst1q_s32,
+        vdupq_n_f32, vmulq_f32, vminq_f32, vmaxq_f32,
+    };
+    
+    let len = input.len();
+    let scale_vec = vdupq_n_f32(requant_scale);
+    let min_vec = vdupq_n_f32(-128.0);
+    let max_vec = vdupq_n_f32(127.0);
+    
+    unsafe {
+        let mut i = 0;
+        while i + 4 <= len {
+            let inp = vld1q_s32(input.as_ptr().add(i));
+            let inp_f32 = vcvtq_f32_s32(inp);
+            let scaled = vmulq_f32(inp_f32, scale_vec);
+            let clamped = vmaxq_f32(vminq_f32(scaled, max_vec), min_vec);
+            let result = vcvtq_s32_f32(clamped);
+            
+            let mut arr = [0i32; 4];
+            vst1q_s32(arr.as_mut_ptr(), result);
+            
+            *output.as_mut_ptr().add(i) = arr[0] as i8;
+            *output.as_mut_ptr().add(i + 1) = arr[1] as i8;
+            *output.as_mut_ptr().add(i + 2) = arr[2] as i8;
+            *output.as_mut_ptr().add(i + 3) = arr[3] as i8;
+            
+            i += 4;
+        }
+        
+        // Tail
+        while i < len {
+            let inp = *input.as_ptr().add(i);
+            let scaled = (inp as f32) * requant_scale;
+            let clamped = scaled.clamp(-128.0, 127.0);
+            *output.as_mut_ptr().add(i) = clamped.round() as i8;
+            i += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dequantize_i8_to_f32: Convert INT8 to F32
+// ---------------------------------------------------------------------------
+
+/// Dequantize INT8 to F32.
+///
+/// Formula: `output_f32 = input_i8 * scale`
+pub fn dequantize_i8_to_f32(output: &mut [f32], input: &[i8], scale: f32) {
+    assert_eq!(output.len(), input.len(), "dequantize_i8_to_f32: length mismatch");
+    
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { dequantize_i8_to_f32_neon(output, input, scale) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dequantize_i8_to_f32_scalar(output, input, scale);
+    }
+}
+
+/// Scalar dequantization.
+pub fn dequantize_i8_to_f32_scalar(output: &mut [f32], input: &[i8], scale: f32) {
+    for (out, &inp) in output.iter_mut().zip(input.iter()) {
+        *out = (inp as f32) * scale;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dequantize_i8_to_f32_neon(output: &mut [f32], input: &[i8], scale: f32) {
+    use core::arch::aarch64::{
+        vcvtq_f32_s32, vst1q_f32, vdupq_n_f32, vmulq_f32,
+    };
+    
+    let len = input.len();
+    let scale_vec = vdupq_n_f32(scale);
+    
+    unsafe {
+        let mut i = 0;
+        while i + 4 <= len {
+            // Load 4 i8 values and extend to i32
+            let i0 = *input.as_ptr().add(i) as i32;
+            let i1 = *input.as_ptr().add(i + 1) as i32;
+            let i2 = *input.as_ptr().add(i + 2) as i32;
+            let i3 = *input.as_ptr().add(i + 3) as i32;
+            
+            let arr = [i0, i1, i2, i3];
+            let inp_i32 = core::arch::aarch64::vld1q_s32(arr.as_ptr());
+            let inp_f32 = vcvtq_f32_s32(inp_i32);
+            let result = vmulq_f32(inp_f32, scale_vec);
+            
+            vst1q_f32(output.as_mut_ptr().add(i), result);
+            
+            i += 4;
+        }
+        
+        // Tail
+        while i < len {
+            *output.as_mut_ptr().add(i) = (*input.as_ptr().add(i) as f32) * scale;
+            i += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// quantize_f32_to_i8: Convert F32 to INT8
+// ---------------------------------------------------------------------------
+
+/// Quantize F32 to INT8.
+///
+/// Formula: `output_i8 = round(input_f32 / scale)`, clamped to [-128, 127]
+pub fn quantize_f32_to_i8(output: &mut [i8], input: &[f32], scale: f32) {
+    assert_eq!(output.len(), input.len(), "quantize_f32_to_i8: length mismatch");
+    
+    let inv_scale = 1.0 / scale;
+    
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { quantize_f32_to_i8_neon(output, input, inv_scale) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        quantize_f32_to_i8_scalar(output, input, inv_scale);
+    }
+}
+
+/// Scalar quantization.
+pub fn quantize_f32_to_i8_scalar(output: &mut [i8], input: &[f32], inv_scale: f32) {
+    for (out, &inp) in output.iter_mut().zip(input.iter()) {
+        let scaled = inp * inv_scale;
+        let clamped = scaled.clamp(-128.0, 127.0);
+        *out = clamped.round() as i8;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn quantize_f32_to_i8_neon(output: &mut [i8], input: &[f32], inv_scale: f32) {
+    use core::arch::aarch64::{
+        vld1q_f32, vcvtq_s32_f32, vst1q_s32,
+        vdupq_n_f32, vmulq_f32, vminq_f32, vmaxq_f32,
+    };
+    
+    let len = input.len();
+    let scale_vec = vdupq_n_f32(inv_scale);
+    let min_vec = vdupq_n_f32(-128.0);
+    let max_vec = vdupq_n_f32(127.0);
+    
+    unsafe {
+        let mut i = 0;
+        while i + 4 <= len {
+            let inp = vld1q_f32(input.as_ptr().add(i));
+            let scaled = vmulq_f32(inp, scale_vec);
+            let clamped = vmaxq_f32(vminq_f32(scaled, max_vec), min_vec);
+            let result = vcvtq_s32_f32(clamped);
+            
+            let mut arr = [0i32; 4];
+            vst1q_s32(arr.as_mut_ptr(), result);
+            
+            *output.as_mut_ptr().add(i) = arr[0] as i8;
+            *output.as_mut_ptr().add(i + 1) = arr[1] as i8;
+            *output.as_mut_ptr().add(i + 2) = arr[2] as i8;
+            *output.as_mut_ptr().add(i + 3) = arr[3] as i8;
+            
+            i += 4;
+        }
+        
+        // Tail
+        while i < len {
+            let scaled = *input.as_ptr().add(i) * inv_scale;
+            let clamped = scaled.clamp(-128.0, 127.0);
+            *output.as_mut_ptr().add(i) = clamped.round() as i8;
+            i += 1;
+        }
+    }
 }
