@@ -189,6 +189,24 @@ pub enum OpParams {
     GlobalAvgPool,
     /// Add (elementwise, no params).
     Add,
+    /// MaxPool parameters.
+    MaxPool {
+        /// Kernel size [H, W].
+        kernel_shape: [usize; 2],
+        /// Stride [H, W].
+        strides: [usize; 2],
+        /// Padding [top, left, bottom, right].
+        pads: [usize; 4],
+    },
+    /// AveragePool parameters.
+    AvgPool {
+        /// Kernel size [H, W].
+        kernel_shape: [usize; 2],
+        /// Stride [H, W].
+        strides: [usize; 2],
+        /// Padding [top, left, bottom, right].
+        pads: [usize; 4],
+    },
 }
 
 /// Validation report from the validate pass.
@@ -608,6 +626,201 @@ impl OpBuilder for GlobalAvgPoolBuilder {
     }
 }
 
+// --- MaxPool ---
+struct MaxPoolBuilder;
+static MAXPOOL_BUILDER: MaxPoolBuilder = MaxPoolBuilder;
+
+impl OpBuilder for MaxPoolBuilder {
+    fn op_type(&self) -> &'static str { "MaxPool" }
+
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.len() != 1 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "1",
+            });
+        }
+
+        // Check for unsupported attributes
+        let ceil_mode = node.get_attr_int("ceil_mode", 0);
+        if ceil_mode != 0 {
+            return Err(UnsupportedReason::UnsupportedAttribute {
+                name: "ceil_mode".into(),
+                value: ceil_mode.to_string(),
+                reason: "only ceil_mode=0 supported".into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
+
+        if input_shape.dims.len() != 4 {
+            return Err(Error::Validation("MaxPool input must be 4D".into()));
+        }
+
+        // Extract attributes
+        let kernel_shape = node.get_attr_ints("kernel_shape");
+        if kernel_shape.is_empty() {
+            return Err(Error::Validation("MaxPool requires kernel_shape".into()));
+        }
+        let strides = node.get_attr_ints("strides");
+        let pads = node.get_attr_ints("pads");
+
+        if kernel_shape.len() != 2 {
+            return Err(Error::Validation("only 2D pooling supported".into()));
+        }
+
+        let n = input_shape.dims[0];
+        let h_in = input_shape.dims[1];
+        let w_in = input_shape.dims[2];
+        let c = input_shape.dims[3];
+
+        let k_h = kernel_shape[0] as usize;
+        let k_w = kernel_shape[1] as usize;
+        let stride_h = strides.first().map(|&v| v as usize).unwrap_or(1);
+        let stride_w = strides.get(1).map(|&v| v as usize).unwrap_or(stride_h);
+        let pad_h = pads.first().map(|&v| v as usize).unwrap_or(0);
+        let pad_w = pads.get(1).map(|&v| v as usize).unwrap_or(0);
+
+        // Output dimensions
+        let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+        let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+
+        Ok(TensorShape::new(vec![n, h_out, w_out, c], ctx.dtype))
+    }
+
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let output_shape = self.validate(node, ctx)?;
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+
+        let kernel_shape = node.get_attr_ints("kernel_shape");
+        let strides = node.get_attr_ints("strides");
+        let pads = node.get_attr_ints("pads");
+
+        let k_h = kernel_shape[0] as usize;
+        let k_w = kernel_shape[1] as usize;
+        let stride_h = strides.first().map(|&v| v as usize).unwrap_or(1);
+        let stride_w = strides.get(1).map(|&v| v as usize).unwrap_or(stride_h);
+
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "MaxPool".into(),
+            inputs: node.inputs.clone(),
+            outputs: node.outputs.clone(),
+            params: OpParams::MaxPool {
+                kernel_shape: [k_h, k_w],
+                strides: [stride_h, stride_w],
+                pads: [
+                    pads.first().map(|&v| v as usize).unwrap_or(0),
+                    pads.get(1).map(|&v| v as usize).unwrap_or(0),
+                    pads.get(2).map(|&v| v as usize).unwrap_or(0),
+                    pads.get(3).map(|&v| v as usize).unwrap_or(0),
+                ],
+            },
+        })
+    }
+}
+
+// --- AveragePool ---
+struct AvgPoolBuilder;
+static AVGPOOL_BUILDER: AvgPoolBuilder = AvgPoolBuilder;
+
+impl OpBuilder for AvgPoolBuilder {
+    fn op_type(&self) -> &'static str { "AveragePool" }
+
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.len() != 1 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "1",
+            });
+        }
+
+        let ceil_mode = node.get_attr_int("ceil_mode", 0);
+        if ceil_mode != 0 {
+            return Err(UnsupportedReason::UnsupportedAttribute {
+                name: "ceil_mode".into(),
+                value: ceil_mode.to_string(),
+                reason: "only ceil_mode=0 supported".into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
+
+        if input_shape.dims.len() != 4 {
+            return Err(Error::Validation("AveragePool input must be 4D".into()));
+        }
+
+        let kernel_shape = node.get_attr_ints("kernel_shape");
+        if kernel_shape.is_empty() {
+            return Err(Error::Validation("AveragePool requires kernel_shape".into()));
+        }
+        let strides = node.get_attr_ints("strides");
+        let pads = node.get_attr_ints("pads");
+
+        if kernel_shape.len() != 2 {
+            return Err(Error::Validation("only 2D pooling supported".into()));
+        }
+
+        let n = input_shape.dims[0];
+        let h_in = input_shape.dims[1];
+        let w_in = input_shape.dims[2];
+        let c = input_shape.dims[3];
+
+        let k_h = kernel_shape[0] as usize;
+        let k_w = kernel_shape[1] as usize;
+        let stride_h = strides.first().map(|&v| v as usize).unwrap_or(1);
+        let stride_w = strides.get(1).map(|&v| v as usize).unwrap_or(stride_h);
+        let pad_h = pads.first().map(|&v| v as usize).unwrap_or(0);
+        let pad_w = pads.get(1).map(|&v| v as usize).unwrap_or(0);
+
+        let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+        let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+
+        Ok(TensorShape::new(vec![n, h_out, w_out, c], ctx.dtype))
+    }
+
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let output_shape = self.validate(node, ctx)?;
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+
+        let kernel_shape = node.get_attr_ints("kernel_shape");
+        let strides = node.get_attr_ints("strides");
+        let pads = node.get_attr_ints("pads");
+
+        let k_h = kernel_shape[0] as usize;
+        let k_w = kernel_shape[1] as usize;
+        let stride_h = strides.first().map(|&v| v as usize).unwrap_or(1);
+        let stride_w = strides.get(1).map(|&v| v as usize).unwrap_or(stride_h);
+
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "AveragePool".into(),
+            inputs: node.inputs.clone(),
+            outputs: node.outputs.clone(),
+            params: OpParams::AvgPool {
+                kernel_shape: [k_h, k_w],
+                strides: [stride_h, stride_w],
+                pads: [
+                    pads.first().map(|&v| v as usize).unwrap_or(0),
+                    pads.get(1).map(|&v| v as usize).unwrap_or(0),
+                    pads.get(2).map(|&v| v as usize).unwrap_or(0),
+                    pads.get(3).map(|&v| v as usize).unwrap_or(0),
+                ],
+            },
+        })
+    }
+}
+
 // --- Gemm ---
 struct GemmBuilder;
 static GEMM_BUILDER: GemmBuilder = GemmBuilder;
@@ -955,8 +1168,7 @@ placeholder_builder!(UnsqueezeBuilderImpl, UNSQUEEZE_BUILDER, "Unsqueeze");
 placeholder_builder!(TransposeBuilderImpl, TRANSPOSE_BUILDER, "Transpose");
 placeholder_builder!(BatchNormBuilderImpl, BATCHNORM_BUILDER, "BatchNormalization");
 placeholder_builder!(PadBuilderImpl, PAD_BUILDER, "Pad");
-placeholder_builder!(MaxPoolBuilderImpl, MAXPOOL_BUILDER, "MaxPool");
-placeholder_builder!(AvgPoolBuilderImpl, AVGPOOL_BUILDER, "AveragePool");
+// MaxPool and AveragePool are implemented above
 placeholder_builder!(ShapeBuilderImpl, SHAPE_BUILDER, "Shape");
 placeholder_builder!(GatherBuilderImpl, GATHER_BUILDER, "Gather");
 placeholder_builder!(ConcatBuilderImpl, CONCAT_BUILDER, "Concat");

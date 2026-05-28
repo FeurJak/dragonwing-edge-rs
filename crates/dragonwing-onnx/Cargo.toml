@@ -13,6 +13,8 @@ workspace = true
 
 [features]
 default = []
+cpu = ["dep:dragonwing-cpu"]
 
 [dependencies]
 dragonwing-core = { path = "../dragonwing-core" }
+dragonwing-cpu = { path = "../dragonwing-cpu", optional = true }

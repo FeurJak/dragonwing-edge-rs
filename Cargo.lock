@@ -51,6 +51,7 @@ name = "dragonwing-onnx"
 version = "0.0.1"
 dependencies = [
  "dragonwing-core",
+ "dragonwing-cpu",
 ]
 
 [[package]]

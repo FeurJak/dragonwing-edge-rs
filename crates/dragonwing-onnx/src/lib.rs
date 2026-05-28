@@ -47,11 +47,17 @@ mod proto;
 mod model;
 mod builder;
 mod graph;
+mod runtime;
 
 pub use error::{Error, Result};
-pub use model::{Model, OnnxNode, OnnxTensor, OnnxAttribute, AttributeValue};
+pub use model::{Model, OnnxNode, OnnxTensor, OnnxAttribute, AttributeValue, DataType};
 pub use builder::{OpBuilder, BuildContext, UnsupportedReason, ValidationReport, TensorShape, CompiledOp, OpParams};
-pub use graph::Graph;
+pub use graph::{Graph, validate_model, compile_model, fold_batchnorm};
+pub use runtime::GraphRuntime;
+
+/// CPU-optimized graph runtime (requires `cpu` feature).
+#[cfg(feature = "cpu")]
+pub use runtime::CpuGraphRuntime;
 
 use std::path::Path;
 
