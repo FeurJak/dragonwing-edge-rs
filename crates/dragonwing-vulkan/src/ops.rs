@@ -1513,3 +1513,96 @@ pub fn softmax_f32(
     one_shot.end()?;
     one_shot.submit()
 }
+
+// ===========================================================================
+// YOLO ops (Task 005)
+// ===========================================================================
+
+/// Element-wise sigmoid: y[i] = 1 / (1 + exp(-x[i])).
+pub fn sigmoid_f32(
+    backend: &VulkanBackend,
+    input: &VulkanBuffer,
+    output: &mut VulkanBuffer,
+) -> Result<()> {
+    let n = input.len_bytes() / 4;
+    if output.len_bytes() != input.len_bytes() {
+        return Err(Error::Backend("sigmoid: buffer size mismatch".into()));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::SigmoidF32)?;
+    let desc_set = backend.pipelines().allocate_descriptor_set(cached.descriptor_set_layout)?;
+
+    let buf_infos = [
+        vk::DescriptorBufferInfo { buffer: output.vk_buffer(), offset: 0, range: vk::WHOLE_SIZE },
+        vk::DescriptorBufferInfo { buffer: input.vk_buffer(), offset: 0, range: vk::WHOLE_SIZE },
+    ];
+    let writes = [
+        vk::WriteDescriptorSet::default().dst_set(desc_set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&buf_infos[0..1]),
+        vk::WriteDescriptorSet::default().dst_set(desc_set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&buf_infos[1..2]),
+    ];
+    unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushSigmoid { n: u32, _p0: u32, _p1: u32, _p2: u32 }
+    let pc = PushSigmoid { n: n as u32, _p0: 0, _p1: 0, _p2: 0 };
+    let pc_bytes: &[u8] = unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), 16) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.layout, 0, &[desc_set], &[]);
+        device.cmd_push_constants(one_shot.cmd, cached.layout, vk::ShaderStageFlags::COMPUTE, 0, pc_bytes);
+        device.cmd_dispatch(one_shot.cmd, (n as u32).div_ceil(64), 1, 1);
+    }
+    one_shot.end()?;
+    one_shot.submit()
+}
+
+/// Element-wise multiplication: y[i] = a[i] * b[i].
+pub fn mul_f32(
+    backend: &VulkanBackend,
+    a: &VulkanBuffer,
+    b: &VulkanBuffer,
+    output: &mut VulkanBuffer,
+) -> Result<()> {
+    let n = a.len_bytes() / 4;
+    if a.len_bytes() != b.len_bytes() || a.len_bytes() != output.len_bytes() {
+        return Err(Error::Backend("mul: buffer size mismatch".into()));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::MulF32)?;
+    let desc_set = backend.pipelines().allocate_descriptor_set(cached.descriptor_set_layout)?;
+
+    let buf_infos = [
+        vk::DescriptorBufferInfo { buffer: output.vk_buffer(), offset: 0, range: vk::WHOLE_SIZE },
+        vk::DescriptorBufferInfo { buffer: a.vk_buffer(), offset: 0, range: vk::WHOLE_SIZE },
+        vk::DescriptorBufferInfo { buffer: b.vk_buffer(), offset: 0, range: vk::WHOLE_SIZE },
+    ];
+    let writes = [
+        vk::WriteDescriptorSet::default().dst_set(desc_set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&buf_infos[0..1]),
+        vk::WriteDescriptorSet::default().dst_set(desc_set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&buf_infos[1..2]),
+        vk::WriteDescriptorSet::default().dst_set(desc_set).dst_binding(2).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&buf_infos[2..3]),
+    ];
+    unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushMul { n: u32, _p0: u32, _p1: u32, _p2: u32 }
+    let pc = PushMul { n: n as u32, _p0: 0, _p1: 0, _p2: 0 };
+    let pc_bytes: &[u8] = unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), 16) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.layout, 0, &[desc_set], &[]);
+        device.cmd_push_constants(one_shot.cmd, cached.layout, vk::ShaderStageFlags::COMPUTE, 0, pc_bytes);
+        device.cmd_dispatch(one_shot.cmd, (n as u32).div_ceil(64), 1, 1);
+    }
+    one_shot.end()?;
+    one_shot.submit()
+}

@@ -1,0 +1,42 @@
+#version 450
+//
+// sigmoid_f32 — element-wise sigmoid: y[i] = 1.0 / (1.0 + exp(-x[i])).
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Y[]   (write-only, output)
+//   set=0 binding=1  std430 buffer X[]   (read-only, input)
+//
+// Push constants (16 bytes):
+//   uint  n         — element count
+//   uint  _pad0
+//   uint  _pad1
+//   uint  _pad2
+//
+// Dispatch:
+//   gx = ceil(n / 64). gy = gz = 1.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer YBuf {
+    float y[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer XBuf {
+    float x[];
+};
+
+layout(push_constant) uniform Pc {
+    uint  n;
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.n) {
+        return;
+    }
+    float val = x[gid];
+    y[gid] = 1.0 / (1.0 + exp(-val));
+}
