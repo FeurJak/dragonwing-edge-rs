@@ -463,6 +463,9 @@ fn parse_attribute(mut reader: ProtoReader<'_>) -> Result<OnnxAttribute> {
     let mut name = String::new();
     let mut value = AttributeValue::Int(0);
     let mut has_value = false;
+    // For accumulating repeated non-packed values
+    let mut ints_accum = Vec::new();
+    let mut floats_accum = Vec::new();
 
     while let Some(field) = reader.read_field()? {
         match field.field_number {
@@ -481,29 +484,49 @@ fn parse_attribute(mut reader: ProtoReader<'_>) -> Result<OnnxAttribute> {
                 );
                 has_value = true;
             }
-            6 => {
-                // Tensor attribute
+            5 => {
+                // Tensor attribute (field 5 in ONNX AttributeProto is 't' for tensor)
+                // Note: field 6 is 'g' for graph, which we don't support
                 let tensor = parse_tensor(field.data.as_message()?)?;
                 value = AttributeValue::Tensor(tensor);
                 has_value = true;
             }
             7 => {
-                // Repeated floats (packed)
-                let floats = parse_packed_floats(field.data.as_bytes()?)?;
-                value = AttributeValue::Floats(floats);
+                // Repeated floats - can be packed or non-packed
+                match &field.data {
+                    crate::proto::FieldData::LengthDelimited(bytes) => {
+                        floats_accum.extend(parse_packed_floats(bytes)?);
+                    }
+                    crate::proto::FieldData::Fixed32(v) => {
+                        floats_accum.push(f32::from_bits(*v));
+                    }
+                    _ => return Err(Error::Parse("unexpected wire type for floats".into())),
+                }
                 has_value = true;
             }
             8 => {
-                // Repeated ints (packed)
-                let ints = parse_packed_int64(field.data.as_bytes()?)?;
-                value = AttributeValue::Ints(ints);
+                // Repeated ints - can be packed or non-packed
+                match &field.data {
+                    crate::proto::FieldData::LengthDelimited(bytes) => {
+                        ints_accum.extend(parse_packed_int64(bytes)?);
+                    }
+                    crate::proto::FieldData::Varint(v) => {
+                        ints_accum.push(*v as i64);
+                    }
+                    _ => return Err(Error::Parse("unexpected wire type for ints".into())),
+                }
                 has_value = true;
             }
             _ => {}
         }
     }
 
-    if !has_value {
+    // If we accumulated repeated values, use those
+    if !ints_accum.is_empty() {
+        value = AttributeValue::Ints(ints_accum);
+    } else if !floats_accum.is_empty() {
+        value = AttributeValue::Floats(floats_accum);
+    } else if !has_value {
         // Default to empty ints for missing values
         value = AttributeValue::Ints(Vec::new());
     }
@@ -523,8 +546,16 @@ fn parse_tensor(mut reader: ProtoReader<'_>) -> Result<OnnxTensor> {
     while let Some(field) = reader.read_field()? {
         match field.field_number {
             1 => {
-                // dims (packed int64)
-                dims = parse_packed_int64(field.data.as_bytes()?)?;
+                // dims - can be packed (length-delimited) or non-packed (repeated varint)
+                match &field.data {
+                    crate::proto::FieldData::LengthDelimited(bytes) => {
+                        dims = parse_packed_int64(bytes)?;
+                    }
+                    crate::proto::FieldData::Varint(v) => {
+                        dims.push(*v as i64);
+                    }
+                    _ => return Err(Error::Parse("unexpected wire type for dims".into())),
+                }
             }
             2 => {
                 data_type = DataType::try_from(field.data.as_int32()?)?;
@@ -714,5 +745,83 @@ mod tests {
         assert_eq!(node.get_attr_ints("strides"), vec![1, 1]);
         assert_eq!(node.get_attr_int("group", 1), 1);
         assert_eq!(node.get_attr_int("dilations", 1), 1); // default
+    }
+
+    #[test]
+    #[ignore] // Requires artifacts/models/mobilenetv2-12.onnx
+    fn test_parse_mobilenetv2() {
+        let model_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../artifacts/models/mobilenetv2-12.onnx");
+        let bytes = std::fs::read(model_path).expect("Failed to read model file");
+        let model = parse_model(&bytes).expect("Failed to parse model");
+
+        // MobileNetV2 basic properties
+        assert_eq!(model.opset_version, 12);
+        
+        // Should have a reasonable number of nodes (MobileNetV2 has ~150+ nodes)
+        assert!(model.nodes.len() > 100, "Expected >100 nodes, got {}", model.nodes.len());
+        
+        // Should have initializers (weights)
+        assert!(model.initializers.len() > 50, "Expected >50 initializers, got {}", model.initializers.len());
+        
+        // Check input shape: [batch, 3, 224, 224] (NCHW in ONNX)
+        assert_eq!(model.inputs.len(), 1);
+        let input = &model.inputs[0];
+        assert_eq!(input.shape.len(), 4);
+        assert_eq!(input.shape[1], 3);  // Channels
+        assert_eq!(input.shape[2], 224); // Height
+        assert_eq!(input.shape[3], 224); // Width
+        
+        // Check output: should be [batch, 1000] for ImageNet classes
+        assert_eq!(model.outputs.len(), 1);
+        let output = &model.outputs[0];
+        assert_eq!(output.shape.len(), 2);
+        assert_eq!(output.shape[1], 1000); // 1000 ImageNet classes
+        
+        // Count op types
+        let mut op_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for node in &model.nodes {
+            *op_counts.entry(&node.op_type).or_insert(0) += 1;
+        }
+        
+        println!("MobileNetV2 parsed successfully:");
+        println!("  IR version: {}", model.ir_version);
+        println!("  Opset version: {}", model.opset_version);
+        println!("  Nodes: {}", model.nodes.len());
+        println!("  Initializers: {}", model.initializers.len());
+        println!("  Input: {} {:?}", input.name, input.shape);
+        println!("  Output: {} {:?}", output.name, output.shape);
+        println!("  Op counts:");
+        let mut sorted_ops: Vec<_> = op_counts.iter().collect();
+        sorted_ops.sort_by_key(|(k, _)| *k);
+        for (op, count) in sorted_ops {
+            println!("    {}: {}", op, count);
+        }
+        
+        // Print special ops (non-standard ones we may need to handle)
+        println!("\n  Shape manipulation ops:");
+        for node in &model.nodes {
+            match node.op_type.as_str() {
+                "Shape" | "Gather" | "Unsqueeze" | "Concat" | "Constant" | "Reshape" => {
+                    println!("    {} ({}): inputs={:?} outputs={:?}", 
+                        node.op_type, node.name, node.inputs, node.outputs);
+                    for attr in &node.attributes {
+                        println!("      attr: {} = {:?}", attr.name, attr.value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        // Check for tensor 630
+        println!("\n  Looking for tensor '630':");
+        for init in &model.initializers {
+            if init.name == "630" {
+                println!("    Found as initializer: dims={:?}, dtype={:?}, data_len={}", 
+                    init.dims, init.data_type, init.data.len());
+                if init.data.len() <= 16 {
+                    println!("    data: {:?}", init.data);
+                }
+            }
+        }
     }
 }

@@ -80,8 +80,11 @@ pub struct BuildContext<'a> {
     pub dtype: Dtype,
     /// Symbol table: tensor name → shape.
     pub shapes: HashMap<String, TensorShape>,
-    /// Initializers (constant tensors).
+    /// Initializers (constant tensors from model).
     pub initializers: &'a HashMap<String, OnnxTensor>,
+    /// Runtime-computed constants (for constant folding).
+    /// These are tensors that can be computed at compile time.
+    pub constants: HashMap<String, Vec<u8>>,
 }
 
 impl<'a> BuildContext<'a> {
@@ -91,6 +94,7 @@ impl<'a> BuildContext<'a> {
             dtype,
             shapes: HashMap::new(),
             initializers,
+            constants: HashMap::new(),
         }
     }
 
@@ -112,6 +116,24 @@ impl<'a> BuildContext<'a> {
     /// Get an initializer by name.
     pub fn get_initializer(&self, name: &str) -> Option<&OnnxTensor> {
         self.initializers.get(name)
+    }
+    
+    /// Check if a tensor is a compile-time constant (initializer or folded).
+    pub fn is_constant(&self, name: &str) -> bool {
+        self.initializers.contains_key(name) || self.constants.contains_key(name)
+    }
+    
+    /// Get constant data by name (checks both initializers and folded constants).
+    pub fn get_constant_data(&self, name: &str) -> Option<&[u8]> {
+        if let Some(init) = self.initializers.get(name) {
+            return Some(&init.data);
+        }
+        self.constants.get(name).map(|v| v.as_slice())
+    }
+    
+    /// Set a runtime-computed constant.
+    pub fn set_constant(&mut self, name: String, data: Vec<u8>) {
+        self.constants.insert(name, data);
     }
 }
 
@@ -1014,8 +1036,8 @@ impl OpBuilder for ReshapeBuilder {
                 expected: "2",
             });
         }
-        // Shape must be constant
-        if !ctx.is_initializer(&node.inputs[1]) {
+        // Shape must be constant (initializer or constant-folded)
+        if !ctx.is_constant(&node.inputs[1]) {
             return Err(UnsupportedReason::Other("Reshape shape must be constant".into()));
         }
         Ok(())
@@ -1025,12 +1047,14 @@ impl OpBuilder for ReshapeBuilder {
         let input_shape = ctx.get_shape(&node.inputs[0])
             .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
         
-        let shape_tensor = ctx.get_initializer(&node.inputs[1])
+        // Get shape from constant data (initializer or folded constant)
+        let shape_data = ctx.get_constant_data(&node.inputs[1])
             .ok_or_else(|| Error::Validation("Reshape shape not found".into()))?;
         
-        let target_shape: Vec<i64> = shape_tensor.as_i64_slice()
-            .ok_or_else(|| Error::Validation("Reshape shape must be int64".into()))?
-            .to_vec();
+        // Parse as int64 array
+        let target_shape: Vec<i64> = shape_data.chunks_exact(8)
+            .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
 
         let input_numel = input_shape.numel();
         let mut output_dims = Vec::new();
@@ -1164,12 +1188,382 @@ macro_rules! placeholder_builder {
 }
 
 placeholder_builder!(SqueezeBuilderImpl, SQUEEZE_BUILDER, "Squeeze");
-placeholder_builder!(UnsqueezeBuilderImpl, UNSQUEEZE_BUILDER, "Unsqueeze");
 placeholder_builder!(TransposeBuilderImpl, TRANSPOSE_BUILDER, "Transpose");
 placeholder_builder!(BatchNormBuilderImpl, BATCHNORM_BUILDER, "BatchNormalization");
 placeholder_builder!(PadBuilderImpl, PAD_BUILDER, "Pad");
 // MaxPool and AveragePool are implemented above
-placeholder_builder!(ShapeBuilderImpl, SHAPE_BUILDER, "Shape");
-placeholder_builder!(GatherBuilderImpl, GATHER_BUILDER, "Gather");
-placeholder_builder!(ConcatBuilderImpl, CONCAT_BUILDER, "Concat");
-placeholder_builder!(ConstantBuilderImpl, CONSTANT_BUILDER, "Constant");
+
+// =============================================================================
+// Shape manipulation ops for constant folding
+// =============================================================================
+
+// --- Shape ---
+// Produces the shape of input tensor as an int64 tensor
+struct ShapeBuilderImpl;
+static SHAPE_BUILDER: ShapeBuilderImpl = ShapeBuilderImpl;
+
+impl OpBuilder for ShapeBuilderImpl {
+    fn op_type(&self) -> &'static str { "Shape" }
+    
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.len() != 1 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "1",
+            });
+        }
+        Ok(())
+    }
+    
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("Shape: input {} not found", node.inputs[0])))?;
+        
+        // Output shape is [rank] - dtype is int64 but we use F32 as placeholder
+        // since this gets constant-folded anyway
+        Ok(TensorShape::new(vec![input_shape.dims.len()], Dtype::F32))
+    }
+    
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("Shape: input {} not found", node.inputs[0])))?;
+        
+        // Store the shape values as a constant (int64 bytes)
+        let shape_data: Vec<u8> = input_shape.dims.iter()
+            .flat_map(|&d| (d as i64).to_le_bytes())
+            .collect();
+        let output_shape = TensorShape::new(vec![input_shape.dims.len()], Dtype::F32);
+        
+        ctx.set_constant(node.outputs[0].clone(), shape_data);
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        
+        // No-op at runtime (constant folded)
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Shape".into(),
+            inputs: vec![],  // No runtime inputs needed
+            outputs: node.outputs.clone(),
+            params: OpParams::None,
+        })
+    }
+}
+
+// --- Constant ---
+// Creates a constant tensor from attributes
+struct ConstantBuilderImpl;
+static CONSTANT_BUILDER: ConstantBuilderImpl = ConstantBuilderImpl;
+
+impl OpBuilder for ConstantBuilderImpl {
+    fn op_type(&self) -> &'static str { "Constant" }
+    
+    fn is_supported(&self, _node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        Ok(())
+    }
+    
+    fn validate(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        // Get value from attribute
+        if let Some(attr) = node.get_attr("value") {
+            if let Some(tensor) = attr.value.as_tensor() {
+                let dims: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
+                // All constant-folded tensors use F32 dtype since we only care about bytes
+                return Ok(TensorShape::new(dims, Dtype::F32));
+            }
+        }
+        // Scalar constant from value_int or value_float
+        if node.get_attr("value_int").is_some() {
+            return Ok(TensorShape::new(vec![], Dtype::F32));
+        }
+        if node.get_attr("value_float").is_some() {
+            return Ok(TensorShape::new(vec![], Dtype::F32));
+        }
+        Err(Error::Validation("Constant: no value attribute found".into()))
+    }
+    
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let output_shape = self.validate(node, ctx)?;
+        
+        // Get constant data
+        let data = if let Some(attr) = node.get_attr("value") {
+            if let Some(tensor) = attr.value.as_tensor() {
+                tensor.data.clone()
+            } else {
+                return Err(Error::Validation("Constant: value is not a tensor".into()));
+            }
+        } else if let Some(attr) = node.get_attr("value_int") {
+            if let Some(v) = attr.value.as_int() {
+                v.to_le_bytes().to_vec()
+            } else {
+                return Err(Error::Validation("Constant: value_int is not an int".into()));
+            }
+        } else if let Some(attr) = node.get_attr("value_float") {
+            if let Some(v) = attr.value.as_float() {
+                v.to_le_bytes().to_vec()
+            } else {
+                return Err(Error::Validation("Constant: value_float is not a float".into()));
+            }
+        } else {
+            return Err(Error::Validation("Constant: no value found".into()));
+        };
+        
+        ctx.set_constant(node.outputs[0].clone(), data);
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Constant".into(),
+            inputs: vec![],
+            outputs: node.outputs.clone(),
+            params: OpParams::None,
+        })
+    }
+}
+
+// --- Gather ---
+// Selects elements from tensor using indices
+struct GatherBuilderImpl;
+static GATHER_BUILDER: GatherBuilderImpl = GatherBuilderImpl;
+
+impl OpBuilder for GatherBuilderImpl {
+    fn op_type(&self) -> &'static str { "Gather" }
+    
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.len() != 2 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "2",
+            });
+        }
+        Ok(())
+    }
+    
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let data_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("Gather: data {} not found", node.inputs[0])))?;
+        let indices_shape = ctx.get_shape(&node.inputs[1])
+            .ok_or_else(|| Error::Validation(format!("Gather: indices {} not found", node.inputs[1])))?;
+        
+        let axis = node.get_attr_int("axis", 0) as usize;
+        
+        // Output shape: data.shape[:axis] + indices.shape + data.shape[axis+1:]
+        let mut out_dims = data_shape.dims[..axis].to_vec();
+        out_dims.extend(&indices_shape.dims);
+        if axis + 1 < data_shape.dims.len() {
+            out_dims.extend(&data_shape.dims[axis + 1..]);
+        }
+        
+        Ok(TensorShape::new(out_dims, data_shape.dtype))
+    }
+    
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let output_shape = self.validate(node, ctx)?;
+        
+        // If both inputs are constants, we can fold
+        if ctx.is_constant(&node.inputs[0]) && ctx.is_constant(&node.inputs[1]) {
+            let data_bytes = ctx.get_constant_data(&node.inputs[0])
+                .ok_or_else(|| Error::Validation("Gather: data not found".into()))?;
+            let indices_bytes = ctx.get_constant_data(&node.inputs[1])
+                .ok_or_else(|| Error::Validation("Gather: indices not found".into()))?;
+            
+            let data_shape = ctx.get_shape(&node.inputs[0]).unwrap();
+            let _axis = node.get_attr_int("axis", 0) as usize;
+            
+            // Simple case: scalar index on 1D data (common for shape manipulation)
+            // Note: shape tensors use int64 (8 bytes) even though we track them with F32 dtype
+            if data_shape.dims.len() == 1 {
+                // Infer element size from total data length and shape
+                let num_elements = data_shape.dims[0];
+                let elem_size = if num_elements > 0 { data_bytes.len() / num_elements } else { 8 };
+                
+                // Get index value
+                let index = if indices_bytes.len() == 8 {
+                    i64::from_le_bytes(indices_bytes[..8].try_into().unwrap()) as usize
+                } else if indices_bytes.len() == 4 {
+                    i32::from_le_bytes(indices_bytes[..4].try_into().unwrap()) as usize
+                } else {
+                    // Can't determine index, skip constant folding
+                    ctx.set_shape(node.outputs[0].clone(), output_shape);
+                    return Ok(CompiledOp {
+                        name: node.name.clone(),
+                        op_type: "Gather".into(),
+                        inputs: node.inputs.clone(),
+                        outputs: node.outputs.clone(),
+                        params: OpParams::None,
+                    });
+                };
+                
+                let start = index * elem_size;
+                let end = start + elem_size;
+                if end <= data_bytes.len() {
+                    let result = data_bytes[start..end].to_vec();
+                    ctx.set_constant(node.outputs[0].clone(), result);
+                }
+            }
+            // For other cases, fall back to runtime (not implemented for constant folding)
+        }
+        
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Gather".into(),
+            inputs: if ctx.is_constant(&node.outputs[0]) { vec![] } else { node.inputs.clone() },
+            outputs: node.outputs.clone(),
+            params: OpParams::None,
+        })
+    }
+}
+
+// --- Unsqueeze ---
+// Adds dimensions to tensor
+struct UnsqueezeBuilderImpl;
+static UNSQUEEZE_BUILDER: UnsqueezeBuilderImpl = UnsqueezeBuilderImpl;
+
+impl OpBuilder for UnsqueezeBuilderImpl {
+    fn op_type(&self) -> &'static str { "Unsqueeze" }
+    
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.is_empty() {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: 0,
+                expected: "1 or 2",
+            });
+        }
+        Ok(())
+    }
+    
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("Unsqueeze: input {} not found", node.inputs[0])))?;
+        
+        // Get axes (either from attribute or second input)
+        let axes: Vec<i64> = if node.inputs.len() > 1 {
+            // Opset 13+: axes from input
+            if let Some(data) = ctx.get_constant_data(&node.inputs[1]) {
+                // Parse as i64 array
+                data.chunks_exact(8)
+                    .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect()
+            } else {
+                return Err(Error::Validation("Unsqueeze: axes must be constant".into()));
+            }
+        } else {
+            // Opset <13: axes from attribute
+            node.get_attr_ints("axes")
+        };
+        
+        let rank = input_shape.dims.len() as i64 + axes.len() as i64;
+        let mut out_dims = input_shape.dims.clone();
+        
+        // Sort axes and insert 1s
+        let mut sorted_axes: Vec<i64> = axes.iter().map(|&a| {
+            if a < 0 { a + rank } else { a }
+        }).collect();
+        sorted_axes.sort();
+        
+        for &axis in &sorted_axes {
+            let idx = axis as usize;
+            if idx <= out_dims.len() {
+                out_dims.insert(idx, 1);
+            }
+        }
+        
+        Ok(TensorShape::new(out_dims, input_shape.dtype))
+    }
+    
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let output_shape = self.validate(node, ctx)?;
+        
+        // If input is constant, propagate
+        if ctx.is_constant(&node.inputs[0]) {
+            if let Some(data) = ctx.get_constant_data(&node.inputs[0]) {
+                ctx.set_constant(node.outputs[0].clone(), data.to_vec());
+            }
+        }
+        
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Unsqueeze".into(),
+            inputs: if ctx.is_constant(&node.outputs[0]) { vec![] } else { vec![node.inputs[0].clone()] },
+            outputs: node.outputs.clone(),
+            params: OpParams::None,
+        })
+    }
+}
+
+// --- Concat ---
+// Concatenates tensors along an axis
+struct ConcatBuilderImpl;
+static CONCAT_BUILDER: ConcatBuilderImpl = ConcatBuilderImpl;
+
+impl OpBuilder for ConcatBuilderImpl {
+    fn op_type(&self) -> &'static str { "Concat" }
+    
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.is_empty() {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: 0,
+                expected: ">=1",
+            });
+        }
+        Ok(())
+    }
+    
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let first_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("Concat: input {} not found", node.inputs[0])))?;
+        
+        let axis = {
+            let a = node.get_attr_int("axis", 0);
+            if a < 0 { (first_shape.dims.len() as i64 + a) as usize } else { a as usize }
+        };
+        
+        let mut out_dims = first_shape.dims.clone();
+        
+        // Sum the axis dimension across all inputs
+        for input in &node.inputs[1..] {
+            let shape = ctx.get_shape(input)
+                .ok_or_else(|| Error::Validation(format!("Concat: input {} not found", input)))?;
+            out_dims[axis] += shape.dims[axis];
+        }
+        
+        Ok(TensorShape::new(out_dims, first_shape.dtype))
+    }
+    
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let output_shape = self.validate(node, ctx)?;
+        
+        // If all inputs are constants, fold
+        let all_constant = node.inputs.iter().all(|name| ctx.is_constant(name));
+        if all_constant {
+            let axis = {
+                let first_shape = ctx.get_shape(&node.inputs[0]).unwrap();
+                let a = node.get_attr_int("axis", 0);
+                if a < 0 { (first_shape.dims.len() as i64 + a) as usize } else { a as usize }
+            };
+            
+            // Simple case: 1D tensors (common for shape manipulation)
+            let first_shape = ctx.get_shape(&node.inputs[0]).unwrap();
+            if first_shape.dims.len() == 1 && axis == 0 {
+                let mut result = Vec::new();
+                for input in &node.inputs {
+                    if let Some(data) = ctx.get_constant_data(input) {
+                        result.extend_from_slice(data);
+                    }
+                }
+                ctx.set_constant(node.outputs[0].clone(), result);
+            }
+        }
+        
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Concat".into(),
+            inputs: if ctx.is_constant(&node.outputs[0]) { vec![] } else { node.inputs.clone() },
+            outputs: node.outputs.clone(),
+            params: OpParams::None,
+        })
+    }
+}

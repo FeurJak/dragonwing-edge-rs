@@ -86,6 +86,8 @@ pub fn validate_model(model: &Model, dtype: Dtype) -> ValidationReport {
     }
 
     // Validate each node
+    // We call build() to populate constants for constant-folding ops,
+    // but only report validation results
     for node in &model.nodes {
         let builder = match get_builder(&node.op_type) {
             Some(b) => b,
@@ -106,12 +108,10 @@ pub fn validate_model(model: &Model, dtype: Dtype) -> ValidationReport {
             }
         }
 
-        match builder.validate(node, &ctx) {
-            Ok(shape) => {
-                // Update context with output shape for downstream ops
-                for output in &node.outputs {
-                    ctx.set_shape(output.clone(), shape.clone());
-                }
+        // Call build() to populate constants and shapes
+        match builder.build(node, &mut ctx) {
+            Ok(_compiled) => {
+                // Op validated and built successfully
                 report.supported.push(node.name.clone());
             }
             Err(e) => {
@@ -402,5 +402,125 @@ mod tests {
         let shape = TensorShape::new(vec![1, 3, 224, 224], Dtype::F32);
         assert_eq!(shape.numel(), 1 * 3 * 224 * 224);
         assert_eq!(shape.size_bytes(), 1 * 3 * 224 * 224 * 4);
+    }
+
+    #[test]
+    #[ignore] // Requires artifacts/models/mobilenetv2-12.onnx
+    fn test_validate_mobilenetv2() {
+        let model_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../artifacts/models/mobilenetv2-12.onnx");
+        let bytes = std::fs::read(model_path).expect("Failed to read model file");
+        let model = crate::model::parse_model(&bytes).expect("Failed to parse model");
+        
+        let report = validate_model(&model, Dtype::F32);
+        
+        println!("Validation report:");
+        println!("  Supported: {} ops", report.supported.len());
+        println!("  Unsupported: {} ops", report.unsupported.len());
+        
+        if !report.unsupported.is_empty() {
+            println!("\n  Unsupported ops:");
+            for (name, reason) in &report.unsupported {
+                println!("    {}: {}", name, reason);
+            }
+        }
+        
+        assert!(report.is_fully_supported(), 
+            "Model validation failed with {} unsupported ops", 
+            report.unsupported.len());
+    }
+
+    #[test]
+    #[ignore] // Requires artifacts/models/mobilenetv2-12.onnx  
+    fn test_debug_mobilenetv2_shapes() {
+        let model_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../artifacts/models/mobilenetv2-12.onnx");
+        let bytes = std::fs::read(model_path).expect("Failed to read model file");
+        let model = crate::model::parse_model(&bytes).expect("Failed to parse model");
+        
+        let initializers: HashMap<String, _> = model.initializers.iter()
+            .map(|t| (t.name.clone(), t.clone()))
+            .collect();
+        
+        let mut ctx = BuildContext::new(Dtype::F32, &initializers);
+        
+        // Register input shapes
+        for input in &model.inputs {
+            if initializers.contains_key(&input.name) {
+                continue;
+            }
+            let shape = TensorShape::new(
+                input.shape.iter().map(|&d| if d < 0 { 1 } else { d as usize }).collect(),
+                Dtype::F32,
+            );
+            ctx.set_shape(input.name.clone(), shape);
+        }
+        
+        // Register initializer shapes
+        for init in &model.initializers {
+            let shape = TensorShape::new(
+                init.dims.iter().map(|&d| d as usize).collect(),
+                onnx_dtype_to_dragonwing(init.data_type, Dtype::F32),
+            );
+            ctx.set_shape(init.name.clone(), shape);
+        }
+        
+        // Build nodes and print shapes for last few ops
+        for node in &model.nodes {
+            let builder = match crate::builder::get_builder(&node.op_type) {
+                Some(b) => b,
+                None => continue,
+            };
+            
+            // Print shapes for last few nodes
+            if node.name.contains("Reshape") || node.name.contains("Gemm") || 
+               node.name.contains("Concat") || node.name.contains("GlobalAverage") {
+                println!("\n{} ({}):", node.name, node.op_type);
+                for inp in &node.inputs {
+                    if let Some(shape) = ctx.get_shape(inp) {
+                        println!("  input {}: {:?}", inp, shape.dims);
+                    } else {
+                        println!("  input {}: NOT FOUND", inp);
+                    }
+                }
+            }
+            
+            if builder.is_supported(node, &ctx).is_ok() {
+                if let Ok(_) = builder.build(node, &mut ctx) {
+                    if node.name.contains("Reshape") || node.name.contains("Gemm") ||
+                       node.name.contains("Concat") || node.name.contains("GlobalAverage") {
+                        for out in &node.outputs {
+                            if let Some(shape) = ctx.get_shape(out) {
+                                println!("  output {}: {:?}", out, shape.dims);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // Requires artifacts/models/mobilenetv2-12.onnx
+    fn test_compile_mobilenetv2() {
+        let model_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../artifacts/models/mobilenetv2-12.onnx");
+        let bytes = std::fs::read(model_path).expect("Failed to read model file");
+        let model = crate::model::parse_model(&bytes).expect("Failed to parse model");
+        
+        let graph = compile_model(&model, Dtype::F32).expect("Failed to compile model");
+        
+        println!("Compiled graph:");
+        println!("  Ops: {}", graph.num_ops());
+        println!("  Inputs: {:?}", graph.input_info());
+        println!("  Outputs: {:?}", graph.output_info());
+        
+        // Check expected shapes
+        let inputs = graph.input_info();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].0, "input");
+        assert_eq!(inputs[0].1.dims, vec![1, 3, 224, 224]);
+        
+        let outputs = graph.output_info();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].0, "output");
+        assert_eq!(outputs[0].1.dims, vec![1, 1000]);
     }
 }
