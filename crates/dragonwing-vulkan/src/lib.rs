@@ -77,6 +77,7 @@ pub mod error;
 pub mod memory;
 pub mod ops;
 pub mod pipeline;
+pub mod slab;
 
 use std::sync::Arc;
 
@@ -84,6 +85,7 @@ use dragonwing_core::{Backend, BackendBuffer, BufferKind, Error, Result};
 
 pub use context::{Context, VulkanConfig};
 pub use memory::VulkanBuffer;
+pub use slab::{SlabAllocator, SlabAllocation, SlabStats};
 
 /// The Vulkan compute backend.
 ///
