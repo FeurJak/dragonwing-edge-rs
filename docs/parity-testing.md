@@ -156,6 +156,42 @@ Floating-point results can differ between CPU and GPU due to:
 | `slice_f32` | 0.0 | Subview extraction |
 | `silu_f32` (fused) | 1e-5 | Sigmoid + multiply |
 
+#### INT8 ops (Task 006)
+
+INT8 quantization introduces additional error sources beyond floating-point precision:
+- Quantization error: values rounded to nearest integer
+- Accumulation in INT32 then requantized
+- Scale factor precision
+
+| Op Type | Tolerance | Rationale |
+|---------|-----------|-----------|
+| `quantize_f32_to_i8` | 1 level | Round to nearest integer |
+| `dequantize_i8_to_f32` | scale/2 | Half quantization step |
+| `gemm_i8` | 10% relative | Accumulated quantization error over K elements |
+| `conv2d_i8_nhwc` | 10% relative | Same as GEMM (K = K_h × K_w × C_in) |
+| `add_i8` | 2× scale | Scale adjustment introduces rounding |
+| `relu_i8` | 0 | Exact comparison (max) |
+| `requantize_i32_to_i8` | 1 level | Rounding to INT8 |
+
+#### INT8 Multi-Layer Networks
+
+Error accumulates through multiple quantized layers:
+
+| Network Depth | Tolerance | Notes |
+|---------------|-----------|-------|
+| Single op | 10% relative | Direct INT8 vs F32 comparison |
+| 2-3 layers | 20% relative | Typical backbone segment |
+| Full backbone | 25% relative | YOLO-like networks |
+
+#### INT8 End-to-End
+
+| Comparison | Tolerance | Notes |
+|------------|-----------|-------|
+| MobileNetV2 INT8 vs F32 | <1% top-1 drop | Classification accuracy |
+| YOLOv8n INT8 vs F32 | <2% mAP drop | Detection accuracy |
+| Detection bbox | 2.0 pixels | Wider tolerance for quantization |
+| Detection confidence | 0.05 | 5% absolute confidence variance |
+
 #### End-to-end YOLO
 
 | Comparison | Tolerance | Notes |
@@ -211,6 +247,9 @@ let (a, b, m, n, k) = generators::gemm_test_data(0x12345);
 | resize | [0, 1] | Normalized image values |
 | silu | [-5, 5] | Same as sigmoid (contains sigmoid) |
 | FP16 variants of above | same range, narrower distribution | FP16 max ≈ 65504; we stay well clear |
+| INT8 inputs | [-1, 1] normalized → [-127, 127] | Scale chosen to use full INT8 range |
+| INT8 weights | [-0.5, 0.5] normalized → [-64, 64] | Smaller to prevent accumulator overflow |
+| INT8 GEMM K | ≤ 1024 | Larger K risks INT32 accumulator overflow |
 
 ### End-to-end micro-graph
 
