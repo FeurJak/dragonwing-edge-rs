@@ -24,6 +24,7 @@
 //! compile the pipeline.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -124,6 +125,96 @@ impl OpKind {
     }
 }
 
+// ===========================================================================
+// Pipeline cache persistence
+// ===========================================================================
+
+/// Compute a hash of all shader contents for cache invalidation.
+///
+/// When any shader changes, this hash changes, and the old cache file
+/// is ignored (new filename).
+fn shader_content_hash() -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    
+    let mut hasher = DefaultHasher::new();
+    for (name, blob) in dragonwing_shaders::ALL {
+        name.hash(&mut hasher);
+        blob.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Get the pipeline cache file path.
+///
+/// Format: `$XDG_CACHE_HOME/dragonwing/pipeline-<uuid>-<driver_ver>-<shader_hash>.cache`
+fn cache_file_path(ctx: &Context) -> Option<PathBuf> {
+    let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .map(|p| p.join("dragonwing"))?;
+    
+    let props = ctx.physical_device_properties();
+    
+    // Build a stable identifier from pipeline cache UUID
+    let uuid = props.pipeline_cache_uuid;
+    let uuid_hex: String = uuid.iter().map(|b| format!("{b:02x}")).collect();
+    
+    let driver_ver = props.driver_version;
+    let shader_hash = shader_content_hash();
+    
+    let filename = format!("pipeline-{uuid_hex}-{driver_ver:08x}-{shader_hash:016x}.cache");
+    
+    Some(cache_dir.join(filename))
+}
+
+/// Load pipeline cache data from disk if available.
+fn load_cache_from_disk(path: &std::path::Path) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(data) => {
+            #[cfg(feature = "verbose")]
+            eprintln!("[dragonwing-vulkan] Loaded pipeline cache from {}", path.display());
+            Some(data)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(feature = "verbose")]
+            eprintln!("[dragonwing-vulkan] No pipeline cache found at {}", path.display());
+            None
+        }
+        Err(e) => {
+            eprintln!("[dragonwing-vulkan] Warning: Failed to load pipeline cache: {e}");
+            None
+        }
+    }
+}
+
+/// Save pipeline cache data to disk atomically.
+fn save_cache_to_disk(path: &std::path::Path, data: &[u8]) {
+    // Create parent directory if needed
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("[dragonwing-vulkan] Warning: Failed to create cache directory: {e}");
+            return;
+        }
+    }
+    
+    // Write to temp file then rename for atomicity
+    let temp_path = path.with_extension("cache.tmp");
+    if let Err(e) = std::fs::write(&temp_path, data) {
+        eprintln!("[dragonwing-vulkan] Warning: Failed to write pipeline cache: {e}");
+        return;
+    }
+    
+    if let Err(e) = std::fs::rename(&temp_path, path) {
+        eprintln!("[dragonwing-vulkan] Warning: Failed to rename pipeline cache: {e}");
+        let _ = std::fs::remove_file(&temp_path);
+        return;
+    }
+    
+    #[cfg(feature = "verbose")]
+    eprintln!("[dragonwing-vulkan] Saved pipeline cache to {}", path.display());
+}
+
 /// Cached pipeline + layout for a single op.
 #[derive(Debug, Clone, Copy)]
 pub struct CachedPipeline {
@@ -141,6 +232,10 @@ pub struct PipelineCache {
     vk_cache: vk::PipelineCache,
     descriptor_pool: vk::DescriptorPool,
     inner: Mutex<HashMap<OpKind, CachedPipeline>>,
+    /// Path to the on-disk cache file (if available).
+    cache_path: Option<PathBuf>,
+    /// Whether the cache has been modified since load.
+    dirty: Mutex<bool>,
 }
 
 impl std::fmt::Debug for PipelineCache {
@@ -152,10 +247,18 @@ impl std::fmt::Debug for PipelineCache {
 }
 
 impl PipelineCache {
-    /// Create a new cache. Allocates the descriptor pool up-front.
+    /// Create a new cache. Loads from disk if available.
     pub fn new(ctx: Arc<Context>) -> Result<Self> {
-        // Create VkPipelineCache (empty, no disk serialisation yet).
-        let cache_info = vk::PipelineCacheCreateInfo::default();
+        // Try to load existing cache from disk
+        let cache_path = cache_file_path(&ctx);
+        let initial_data = cache_path.as_ref().and_then(|p| load_cache_from_disk(p));
+        
+        // Create VkPipelineCache with loaded data (or empty if none)
+        let cache_info = if let Some(ref data) = initial_data {
+            vk::PipelineCacheCreateInfo::default().initial_data(data)
+        } else {
+            vk::PipelineCacheCreateInfo::default()
+        };
         // SAFETY: spec-compliant struct.
         let vk_cache = unsafe { ctx.device().create_pipeline_cache(&cache_info, None) }
             .map_err(|r| vk_err("create_pipeline_cache", r))?;
@@ -179,6 +282,8 @@ impl PipelineCache {
             vk_cache,
             descriptor_pool,
             inner: Mutex::new(HashMap::new()),
+            cache_path,
+            dirty: Mutex::new(false),
         })
     }
 
@@ -285,7 +390,42 @@ impl PipelineCache {
             descriptor_set_layout,
         });
 
+        // Mark cache as dirty so it gets saved on drop
+        *self.dirty.lock().expect("dirty mutex poisoned") = true;
+
         Ok(cached)
+    }
+
+    /// Save the pipeline cache to disk if it has been modified.
+    ///
+    /// Called automatically on drop, but can be called explicitly for
+    /// early persistence.
+    pub fn save_if_dirty(&self) {
+        let dirty = *self.dirty.lock().expect("dirty mutex poisoned");
+        if !dirty {
+            return;
+        }
+        
+        let Some(ref path) = self.cache_path else {
+            return;
+        };
+        
+        // Get cache data
+        // SAFETY: vk_cache is valid.
+        let data = match unsafe { self.ctx.device().get_pipeline_cache_data(self.vk_cache) } {
+            Ok(data) if !data.is_empty() => data,
+            Ok(_) => {
+                eprintln!("[dragonwing-vulkan] Warning: Pipeline cache is empty");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[dragonwing-vulkan] Warning: Failed to get pipeline cache data: {e:?}");
+                return;
+            }
+        };
+        
+        save_cache_to_disk(path, &data);
+        *self.dirty.lock().expect("dirty mutex poisoned") = false;
     }
 
     /// Allocate a descriptor set for the given layout.
@@ -322,6 +462,9 @@ impl PipelineCache {
 
 impl Drop for PipelineCache {
     fn drop(&mut self) {
+        // Save cache to disk before destroying
+        self.save_if_dirty();
+        
         // SAFETY: exclusive access via Drop. Destroy pipelines, layouts,
         // descriptor set layouts, pool, cache.
         unsafe {
