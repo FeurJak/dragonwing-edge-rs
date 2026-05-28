@@ -73,6 +73,8 @@ mod postprocess;
 mod fusion;
 #[cfg(feature = "cpu")]
 mod calibration;
+#[cfg(feature = "cpu")]
+mod quantize;
 
 pub use error::{Error, Result};
 pub use model::{Model, OnnxNode, OnnxTensor, OnnxAttribute, AttributeValue, DataType};
@@ -89,6 +91,10 @@ pub use runtime::CpuGraphRuntime;
 /// Calibration tools for INT8 quantization (requires `cpu` feature).
 #[cfg(feature = "cpu")]
 pub use calibration::{Calibrator, CalibrationStrategy};
+
+/// Quantized graph compiler for INT8 inference (requires `cpu` feature).
+#[cfg(feature = "cpu")]
+pub use quantize::{QuantizedGraphCompiler, QuantizedGraphInfo};
 
 use std::path::Path;
 

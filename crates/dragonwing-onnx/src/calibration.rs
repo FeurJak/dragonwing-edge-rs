@@ -322,6 +322,11 @@ impl Calibrator {
                 axes,
                 steps,
             } => self.dispatch_slice(op, starts, ends, axes, steps),
+            // Quantized ops are not used during F32 calibration
+            OpParams::Requantize { .. }
+            | OpParams::AddQuantized { .. }
+            | OpParams::Quantize { .. }
+            | OpParams::Dequantize { .. } => Ok(()),
         }
     }
 

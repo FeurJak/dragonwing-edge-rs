@@ -307,6 +307,31 @@ pub enum OpParams {
         /// Steps.
         steps: Vec<isize>,
     },
+    // =========================================================================
+    // Quantized op parameters (Task 006)
+    // =========================================================================
+    /// Requantization: INT32 accumulator → INT8.
+    Requantize {
+        /// Requantization scale: (input_scale * weight_scale) / output_scale.
+        scale: f32,
+    },
+    /// Quantized Add with scale adjustment.
+    AddQuantized {
+        /// Scale ratio for first input: scale_a / scale_out.
+        scale_a_over_out: f32,
+        /// Scale ratio for second input: scale_b / scale_out.
+        scale_b_over_out: f32,
+    },
+    /// Quantize F32 → INT8.
+    Quantize {
+        /// Quantization scale.
+        scale: f32,
+    },
+    /// Dequantize INT8 → F32.
+    Dequantize {
+        /// Dequantization scale.
+        scale: f32,
+    },
 }
 
 /// Validation report from the validate pass.

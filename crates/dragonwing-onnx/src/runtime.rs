@@ -177,6 +177,14 @@ impl<B: Backend> GraphRuntime<B> {
                     op.op_type
                 )));
             }
+            // Quantized ops (Task 006) - defer to specialized runtime
+            OpParams::Requantize { .. } | OpParams::AddQuantized { .. } |
+            OpParams::Quantize { .. } | OpParams::Dequantize { .. } => {
+                return Err(Error::Runtime(format!(
+                    "{} (quantized) not implemented in generic runtime",
+                    op.op_type
+                )));
+            }
         }
         Ok(())
     }
@@ -905,6 +913,14 @@ mod cpu_runtime {
                 OpParams::Transpose { perm } => self.dispatch_transpose(op, perm),
                 OpParams::Slice { starts, ends, axes, steps } => {
                     self.dispatch_slice(op, starts, ends, axes, steps)
+                }
+                // Quantized ops (Task 006) - placeholder for future INT8 CPU runtime
+                OpParams::Requantize { .. } | OpParams::AddQuantized { .. } |
+                OpParams::Quantize { .. } | OpParams::Dequantize { .. } => {
+                    Err(Error::Runtime(format!(
+                        "{} (quantized) not yet implemented in CpuGraphRuntime",
+                        op.op_type
+                    )))
                 }
             }
         }
