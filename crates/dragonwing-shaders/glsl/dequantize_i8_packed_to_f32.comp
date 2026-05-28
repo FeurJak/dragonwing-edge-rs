@@ -1,0 +1,67 @@
+#version 450
+//
+// dequantize_i8_packed_to_f32 — Convert packed INT8 to F32.
+//
+// Reads packed INT8 data (4 values per UINT32) and outputs F32 values.
+// Used at the end of INT8 inference to convert back to float for output.
+//
+// Formula:
+//   output_f32 = input_i8 * scale
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Output[n]          (write-only, F32)
+//   set=0 binding=1  std430 buffer Input_packed[n/4]  (read-only, UINT32)
+//
+// Push constants (16 bytes):
+//   uint n       // Total elements, must be multiple of 4
+//   float scale  // Quantization scale
+//   uint _pad0
+//   uint _pad1
+//
+// Dispatch:
+//   gx = ceil(n / 64), gy = gz = 1
+//
+// Each invocation processes 1 element.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float output_data[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuf {
+    uint input_packed[];
+};
+
+layout(push_constant) uniform Pc {
+    uint n;
+    float scale;
+    uint _pad0;
+    uint _pad1;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    
+    if (idx >= pc.n) {
+        return;
+    }
+    
+    // Find which UINT32 pack and which byte within it
+    uint pack_idx = idx / 4u;
+    uint byte_idx = idx % 4u;
+    
+    uint packed = input_packed[pack_idx];
+    
+    // Extract the relevant byte
+    uint byte_val = (packed >> (byte_idx * 8u)) & 0xFFu;
+    
+    // Sign-extend to int
+    int i8_val = int(byte_val);
+    if (i8_val >= 128) {
+        i8_val -= 256;
+    }
+    
+    // Scale to float
+    output_data[idx] = float(i8_val) * pc.scale;
+}

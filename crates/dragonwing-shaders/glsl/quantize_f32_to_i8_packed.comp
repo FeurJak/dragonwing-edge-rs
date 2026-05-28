@@ -1,0 +1,79 @@
+#version 450
+//
+// quantize_f32_to_i8_packed — Convert F32 to packed INT8.
+//
+// Reads F32 data and outputs packed INT8 (4 values per UINT32).
+// Used at the start of INT8 inference to quantize float inputs.
+//
+// Formula:
+//   output_i8 = clamp(round(input_f32 / scale), -128, 127)
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Output_packed[n/4]  (write-only, UINT32)
+//   set=0 binding=1  std430 buffer Input[n]            (read-only, F32)
+//
+// Push constants (16 bytes):
+//   uint n          // Total elements, must be multiple of 4
+//   float inv_scale // 1.0 / scale
+//   uint _pad0
+//   uint _pad1
+//
+// Dispatch:
+//   gx = ceil(n / (64 * 4)), gy = gz = 1
+//
+// Each invocation processes 4 F32 values and outputs 1 UINT32.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    uint output_packed[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuf {
+    float input_data[];
+};
+
+layout(push_constant) uniform Pc {
+    uint n;
+    float inv_scale;  // 1.0 / scale
+    uint _pad0;
+    uint _pad1;
+} pc;
+
+// Pack 4 INT8 values into a UINT32 (little-endian)
+uint pack_i8x4(ivec4 vals) {
+    uint b0 = uint(clamp(vals.x, -128, 127)) & 0xFFu;
+    uint b1 = uint(clamp(vals.y, -128, 127)) & 0xFFu;
+    uint b2 = uint(clamp(vals.z, -128, 127)) & 0xFFu;
+    uint b3 = uint(clamp(vals.w, -128, 127)) & 0xFFu;
+    
+    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+}
+
+void main() {
+    uint pack_idx = gl_GlobalInvocationID.x;
+    uint n_packed = pc.n / 4u;
+    
+    if (pack_idx >= n_packed) {
+        return;
+    }
+    
+    uint base_idx = pack_idx * 4u;
+    
+    // Read 4 F32 values
+    float f0 = input_data[base_idx + 0u];
+    float f1 = input_data[base_idx + 1u];
+    float f2 = input_data[base_idx + 2u];
+    float f3 = input_data[base_idx + 3u];
+    
+    // Scale and round
+    ivec4 result = ivec4(
+        int(round(f0 * pc.inv_scale)),
+        int(round(f1 * pc.inv_scale)),
+        int(round(f2 * pc.inv_scale)),
+        int(round(f3 * pc.inv_scale))
+    );
+    
+    // Pack and write
+    output_packed[pack_idx] = pack_i8x4(result);
+}

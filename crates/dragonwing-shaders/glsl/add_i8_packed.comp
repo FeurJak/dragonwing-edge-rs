@@ -1,0 +1,100 @@
+#version 450
+//
+// add_i8_packed — INT8 element-wise addition with requantization.
+//
+// Adds two packed INT8 tensors with different scales, requantizing the
+// result to output scale. Uses float arithmetic internally for precision.
+//
+// Formula:
+//   y_f32 = a_i8 * scale_a + b_i8 * scale_b
+//   y_i8 = clamp(round(y_f32 / scale_y), -128, 127)
+//
+// Optimized computation:
+//   y_i8 = clamp(round(a_i8 * (scale_a/scale_y) + b_i8 * (scale_b/scale_y)), -128, 127)
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Output_packed[n/4]  (write-only, UINT32)
+//   set=0 binding=1  std430 buffer A_packed[n/4]       (read-only, UINT32)
+//   set=0 binding=2  std430 buffer B_packed[n/4]       (read-only, UINT32)
+//
+// Push constants (16 bytes):
+//   uint n              // Total elements, must be multiple of 4
+//   float scale_a_over_y  // scale_a / scale_y
+//   float scale_b_over_y  // scale_b / scale_y
+//   uint _pad
+//
+// Dispatch:
+//   gx = ceil(n / (64 * 4)), gy = gz = 1
+//
+// Each invocation processes 4 pairs of INT8 values.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    uint output_packed[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer ABuf {
+    uint a_packed[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer BBuf {
+    uint b_packed[];
+};
+
+layout(push_constant) uniform Pc {
+    uint n;
+    float scale_a_over_y;
+    float scale_b_over_y;
+    uint _pad;
+} pc;
+
+// Unpack 4 INT8 values from a UINT32 (little-endian)
+ivec4 unpack_i8x4(uint packed) {
+    int i0 = int(packed & 0xFFu);
+    int i1 = int((packed >> 8u) & 0xFFu);
+    int i2 = int((packed >> 16u) & 0xFFu);
+    int i3 = int((packed >> 24u) & 0xFFu);
+    
+    // Sign extension
+    if (i0 >= 128) i0 -= 256;
+    if (i1 >= 128) i1 -= 256;
+    if (i2 >= 128) i2 -= 256;
+    if (i3 >= 128) i3 -= 256;
+    
+    return ivec4(i0, i1, i2, i3);
+}
+
+// Pack 4 INT8 values into a UINT32 (little-endian)
+uint pack_i8x4(ivec4 vals) {
+    uint b0 = uint(clamp(vals.x, -128, 127)) & 0xFFu;
+    uint b1 = uint(clamp(vals.y, -128, 127)) & 0xFFu;
+    uint b2 = uint(clamp(vals.z, -128, 127)) & 0xFFu;
+    uint b3 = uint(clamp(vals.w, -128, 127)) & 0xFFu;
+    
+    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+}
+
+void main() {
+    uint pack_idx = gl_GlobalInvocationID.x;
+    uint n_packed = pc.n / 4u;
+    
+    if (pack_idx >= n_packed) {
+        return;
+    }
+    
+    // Unpack inputs
+    ivec4 a_vals = unpack_i8x4(a_packed[pack_idx]);
+    ivec4 b_vals = unpack_i8x4(b_packed[pack_idx]);
+    
+    // Compute in float
+    vec4 a_f = vec4(a_vals);
+    vec4 b_f = vec4(b_vals);
+    vec4 result_f = a_f * pc.scale_a_over_y + b_f * pc.scale_b_over_y;
+    
+    // Round and clamp
+    ivec4 result = ivec4(round(result_f));
+    
+    // Pack and write
+    output_packed[pack_idx] = pack_i8x4(result);
+}
