@@ -1044,6 +1044,64 @@ mod tests {
         assert_eq!(output[0], 0.0);  // [0,0,0,0]
         assert_eq!(output[1], 12.0); // [0,0,0,1] = input[0,1,0,0]
     }
+
+    #[test]
+    fn sub_f32_basic() {
+        let a: Vec<f32> = (0..100).map(|i| i as f32 * 2.0).collect();
+        let b: Vec<f32> = (0..100).map(|i| i as f32 * 0.5).collect();
+        let mut y = vec![0.0f32; 100];
+        
+        super::sub_f32(&mut y, &a, &b);
+        
+        for i in 0..100 {
+            let expected = a[i] - b[i];
+            assert_eq!(y[i], expected, "sub_f32 mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn sub_f32_matches_scalar() {
+        let a: Vec<f32> = (0..67).map(|i| i as f32 * 1.5).collect();
+        let b: Vec<f32> = (0..67).map(|i| (i as f32).sin()).collect();
+        let mut y_main = vec![0.0f32; 67];
+        let mut y_scalar = vec![0.0f32; 67];
+        
+        super::sub_f32(&mut y_main, &a, &b);
+        super::sub_f32_scalar(&mut y_scalar, &a, &b);
+        
+        for (i, (&a, &b)) in y_main.iter().zip(y_scalar.iter()).enumerate() {
+            assert!(approx_eq(a, b), "sub_f32 mismatch at {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn div_f32_basic() {
+        let a: Vec<f32> = (1..101).map(|i| i as f32 * 2.0).collect();
+        let b: Vec<f32> = (1..101).map(|i| i as f32 * 0.5).collect();
+        let mut y = vec![0.0f32; 100];
+        
+        super::div_f32(&mut y, &a, &b);
+        
+        for i in 0..100 {
+            let expected = a[i] / b[i];
+            assert!(approx_eq(y[i], expected), "div_f32 mismatch at {i}: {} vs {}", y[i], expected);
+        }
+    }
+
+    #[test]
+    fn div_f32_matches_scalar() {
+        let a: Vec<f32> = (1..68).map(|i| i as f32 * 1.5).collect();
+        let b: Vec<f32> = (1..68).map(|i| (i as f32).sin().abs() + 0.1).collect(); // Avoid division by zero
+        let mut y_main = vec![0.0f32; 67];
+        let mut y_scalar = vec![0.0f32; 67];
+        
+        super::div_f32(&mut y_main, &a, &b);
+        super::div_f32_scalar(&mut y_scalar, &a, &b);
+        
+        for (i, (&a, &b)) in y_main.iter().zip(y_scalar.iter()).enumerate() {
+            assert!(approx_eq(a, b), "div_f32 mismatch at {i}: {a} vs {b}");
+        }
+    }
 }
 
 // ===========================================================================
@@ -1687,6 +1745,164 @@ pub fn mul_fp16(y: &mut [F16], a: &[F16], b: &[F16]) {
         let a_f32 = a[i].to_f32();
         let b_f32 = b[i].to_f32();
         y[i] = F16::from_f32(a_f32 * b_f32);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sub: y[i] = a[i] - b[i]
+// ---------------------------------------------------------------------------
+
+/// Element-wise subtraction: `y[i] = a[i] - b[i]`.
+///
+/// # Panics
+///
+/// Panics if lengths don't match.
+pub fn sub_f32(y: &mut [f32], a: &[f32], b: &[f32]) {
+    assert_eq!(y.len(), a.len(), "sub_f32: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "sub_f32: y/b length mismatch");
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { sub_f32_neon(y, a, b) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        sub_f32_scalar(y, a, b);
+    }
+}
+
+/// Portable scalar implementation of [`sub_f32`].
+pub fn sub_f32_scalar(y: &mut [f32], a: &[f32], b: &[f32]) {
+    assert_eq!(y.len(), a.len(), "sub_f32_scalar: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "sub_f32_scalar: y/b length mismatch");
+    for i in 0..y.len() {
+        y[i] = a[i] - b[i];
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sub_f32_neon(y: &mut [f32], a: &[f32], b: &[f32]) {
+    use core::arch::aarch64::{vsubq_f32, vld1q_f32, vst1q_f32};
+    debug_assert_eq!(y.len(), a.len());
+    debug_assert_eq!(y.len(), b.len());
+    let len = y.len();
+    unsafe {
+        let mut i = 0;
+        while i + 16 <= len {
+            let py = y.as_mut_ptr().add(i);
+            let pa = a.as_ptr().add(i);
+            let pb = b.as_ptr().add(i);
+
+            let a0 = vld1q_f32(pa);
+            let a1 = vld1q_f32(pa.add(4));
+            let a2 = vld1q_f32(pa.add(8));
+            let a3 = vld1q_f32(pa.add(12));
+
+            let b0 = vld1q_f32(pb);
+            let b1 = vld1q_f32(pb.add(4));
+            let b2 = vld1q_f32(pb.add(8));
+            let b3 = vld1q_f32(pb.add(12));
+
+            vst1q_f32(py, vsubq_f32(a0, b0));
+            vst1q_f32(py.add(4), vsubq_f32(a1, b1));
+            vst1q_f32(py.add(8), vsubq_f32(a2, b2));
+            vst1q_f32(py.add(12), vsubq_f32(a3, b3));
+            i += 16;
+        }
+        while i < len {
+            *y.get_unchecked_mut(i) = *a.get_unchecked(i) - *b.get_unchecked(i);
+            i += 1;
+        }
+    }
+}
+
+/// FP16 element-wise subtraction.
+pub fn sub_fp16(y: &mut [F16], a: &[F16], b: &[F16]) {
+    assert_eq!(y.len(), a.len(), "sub_fp16: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "sub_fp16: y/b length mismatch");
+    for i in 0..y.len() {
+        let a_f32 = a[i].to_f32();
+        let b_f32 = b[i].to_f32();
+        y[i] = F16::from_f32(a_f32 - b_f32);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// div: y[i] = a[i] / b[i]
+// ---------------------------------------------------------------------------
+
+/// Element-wise division: `y[i] = a[i] / b[i]`.
+///
+/// # Panics
+///
+/// Panics if lengths don't match.
+pub fn div_f32(y: &mut [f32], a: &[f32], b: &[f32]) {
+    assert_eq!(y.len(), a.len(), "div_f32: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "div_f32: y/b length mismatch");
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { div_f32_neon(y, a, b) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        div_f32_scalar(y, a, b);
+    }
+}
+
+/// Portable scalar implementation of [`div_f32`].
+pub fn div_f32_scalar(y: &mut [f32], a: &[f32], b: &[f32]) {
+    assert_eq!(y.len(), a.len(), "div_f32_scalar: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "div_f32_scalar: y/b length mismatch");
+    for i in 0..y.len() {
+        y[i] = a[i] / b[i];
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn div_f32_neon(y: &mut [f32], a: &[f32], b: &[f32]) {
+    use core::arch::aarch64::{vdivq_f32, vld1q_f32, vst1q_f32};
+    debug_assert_eq!(y.len(), a.len());
+    debug_assert_eq!(y.len(), b.len());
+    let len = y.len();
+    unsafe {
+        let mut i = 0;
+        while i + 16 <= len {
+            let py = y.as_mut_ptr().add(i);
+            let pa = a.as_ptr().add(i);
+            let pb = b.as_ptr().add(i);
+
+            let a0 = vld1q_f32(pa);
+            let a1 = vld1q_f32(pa.add(4));
+            let a2 = vld1q_f32(pa.add(8));
+            let a3 = vld1q_f32(pa.add(12));
+
+            let b0 = vld1q_f32(pb);
+            let b1 = vld1q_f32(pb.add(4));
+            let b2 = vld1q_f32(pb.add(8));
+            let b3 = vld1q_f32(pb.add(12));
+
+            vst1q_f32(py, vdivq_f32(a0, b0));
+            vst1q_f32(py.add(4), vdivq_f32(a1, b1));
+            vst1q_f32(py.add(8), vdivq_f32(a2, b2));
+            vst1q_f32(py.add(12), vdivq_f32(a3, b3));
+            i += 16;
+        }
+        while i < len {
+            *y.get_unchecked_mut(i) = *a.get_unchecked(i) / *b.get_unchecked(i);
+            i += 1;
+        }
+    }
+}
+
+/// FP16 element-wise division.
+pub fn div_fp16(y: &mut [F16], a: &[F16], b: &[F16]) {
+    assert_eq!(y.len(), a.len(), "div_fp16: y/a length mismatch");
+    assert_eq!(y.len(), b.len(), "div_fp16: y/b length mismatch");
+    for i in 0..y.len() {
+        let a_f32 = a[i].to_f32();
+        let b_f32 = b[i].to_f32();
+        y[i] = F16::from_f32(a_f32 / b_f32);
     }
 }
 

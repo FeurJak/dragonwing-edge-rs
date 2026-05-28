@@ -233,6 +233,10 @@ pub enum OpParams {
     Sigmoid,
     /// Mul (elementwise, no params).
     Mul,
+    /// Sub (elementwise, no params).
+    Sub,
+    /// Div (elementwise, no params).
+    Div,
     /// Concat parameters.
     Concat {
         /// Axis to concatenate along.
@@ -325,6 +329,8 @@ pub fn get_builder(op_type: &str) -> Option<&'static dyn OpBuilder> {
         "Resize" => Some(&RESIZE_BUILDER),
         "Split" => Some(&SPLIT_BUILDER),
         "Slice" => Some(&SLICE_BUILDER),
+        "Sub" => Some(&SUB_BUILDER),
+        "Div" => Some(&DIV_BUILDER),
         _ => None,
     }
 }
@@ -2045,4 +2051,76 @@ fn get_i64_constant(ctx: &BuildContext<'_>, name: &str) -> Result<Vec<i64>> {
     Ok(unsafe {
         std::slice::from_raw_parts(data.as_ptr() as *const i64, data.len() / 8).to_vec()
     })
+}
+
+// --- Sub ---
+struct SubBuilder;
+static SUB_BUILDER: SubBuilder = SubBuilder;
+
+impl OpBuilder for SubBuilder {
+    fn op_type(&self) -> &'static str { "Sub" }
+
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.len() != 2 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "2",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let a_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
+        Ok(a_shape.clone())
+    }
+
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let output_shape = self.validate(node, ctx)?;
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Sub".into(),
+            inputs: node.inputs.clone(),
+            outputs: node.outputs.clone(),
+            params: OpParams::Sub,
+        })
+    }
+}
+
+// --- Div ---
+struct DivBuilder;
+static DIV_BUILDER: DivBuilder = DivBuilder;
+
+impl OpBuilder for DivBuilder {
+    fn op_type(&self) -> &'static str { "Div" }
+
+    fn is_supported(&self, node: &OnnxNode, _ctx: &BuildContext<'_>) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.len() != 2 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "2",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let a_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
+        Ok(a_shape.clone())
+    }
+
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let output_shape = self.validate(node, ctx)?;
+        ctx.set_shape(node.outputs[0].clone(), output_shape);
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "Div".into(),
+            inputs: node.inputs.clone(),
+            outputs: node.outputs.clone(),
+            params: OpParams::Div,
+        })
+    }
 }

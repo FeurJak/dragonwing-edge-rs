@@ -169,8 +169,8 @@ impl<B: Backend> GraphRuntime<B> {
                 )));
             }
             // YOLO ops (Task 005) - defer to CpuGraphRuntime for full implementation
-            OpParams::Sigmoid | OpParams::Mul | OpParams::Concat { .. } |
-            OpParams::Resize { .. } | OpParams::Split { .. } | 
+            OpParams::Sigmoid | OpParams::Mul | OpParams::Sub | OpParams::Div |
+            OpParams::Concat { .. } | OpParams::Resize { .. } | OpParams::Split { .. } | 
             OpParams::Transpose { .. } | OpParams::Slice { .. } => {
                 return Err(Error::Runtime(format!(
                     "{} not implemented in generic runtime, use CpuGraphRuntime",
@@ -893,6 +893,8 @@ mod cpu_runtime {
                 // YOLO ops (Task 005)
                 OpParams::Sigmoid => self.dispatch_sigmoid(op),
                 OpParams::Mul => self.dispatch_mul(op),
+                OpParams::Sub => self.dispatch_sub(op),
+                OpParams::Div => self.dispatch_div(op),
                 OpParams::Concat { axis } => self.dispatch_concat(op, *axis),
                 OpParams::Resize { out_h, out_w, mode } => {
                     self.dispatch_resize(op, *out_h, *out_w, mode)
@@ -1695,6 +1697,124 @@ mod cpu_runtime {
                     }
                 }
                 _ => return Err(Error::Runtime("unsupported dtype for mul".into())),
+            }
+            Ok(())
+        }
+
+        fn dispatch_sub(&mut self, op: &CompiledOp) -> Result<()> {
+            let a_name = &op.inputs[0];
+            let b_name = &op.inputs[1];
+            let out_name = &op.outputs[0];
+
+            let a_shape = self.graph.shapes.get(a_name)
+                .ok_or_else(|| Error::Runtime(format!("shape not found: {a_name}")))?;
+            let _n = a_shape.numel();
+
+            let (a_ptr, b_ptr, out_ptr) = {
+                let a_buf = self.buffers.get(a_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {a_name}")))?;
+                let b_buf = self.buffers.get(b_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {b_name}")))?;
+                let out_buf = self.buffers.get(out_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {out_name}")))?;
+                (a_buf as *const CpuBuffer, b_buf as *const CpuBuffer, 
+                 out_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+
+            match self.graph.dtype {
+                Dtype::F32 => {
+                    let a = unsafe { (*a_ptr).as_f32() };
+                    let b = unsafe { (*b_ptr).as_f32() };
+                    let output = unsafe { (*out_ptr).as_f32_mut() };
+                    
+                    if a.len() == b.len() {
+                        ops::sub_f32(output, a, b);
+                    } else if b.len() == 1 {
+                        let bv = b[0];
+                        for (o, &av) in output.iter_mut().zip(a.iter()) {
+                            *o = av - bv;
+                        }
+                    } else {
+                        let c = b.len();
+                        for (i, (o, &av)) in output.iter_mut().zip(a.iter()).enumerate() {
+                            *o = av - b[i % c];
+                        }
+                    }
+                }
+                Dtype::F16 => {
+                    let a = unsafe { (*a_ptr).as_f16() };
+                    let b = unsafe { (*b_ptr).as_f16() };
+                    let output = unsafe { (*out_ptr).as_f16_mut() };
+                    
+                    if a.len() == b.len() {
+                        ops::sub_fp16(output, a, b);
+                    } else {
+                        let c = b.len();
+                        for (i, (o, av)) in output.iter_mut().zip(a.iter()).enumerate() {
+                            *o = F16::from_f32(av.to_f32() - b[i % c].to_f32());
+                        }
+                    }
+                }
+                _ => return Err(Error::Runtime("unsupported dtype for sub".into())),
+            }
+            Ok(())
+        }
+
+        fn dispatch_div(&mut self, op: &CompiledOp) -> Result<()> {
+            let a_name = &op.inputs[0];
+            let b_name = &op.inputs[1];
+            let out_name = &op.outputs[0];
+
+            let a_shape = self.graph.shapes.get(a_name)
+                .ok_or_else(|| Error::Runtime(format!("shape not found: {a_name}")))?;
+            let _n = a_shape.numel();
+
+            let (a_ptr, b_ptr, out_ptr) = {
+                let a_buf = self.buffers.get(a_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {a_name}")))?;
+                let b_buf = self.buffers.get(b_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {b_name}")))?;
+                let out_buf = self.buffers.get(out_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {out_name}")))?;
+                (a_buf as *const CpuBuffer, b_buf as *const CpuBuffer, 
+                 out_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+
+            match self.graph.dtype {
+                Dtype::F32 => {
+                    let a = unsafe { (*a_ptr).as_f32() };
+                    let b = unsafe { (*b_ptr).as_f32() };
+                    let output = unsafe { (*out_ptr).as_f32_mut() };
+                    
+                    if a.len() == b.len() {
+                        ops::div_f32(output, a, b);
+                    } else if b.len() == 1 {
+                        let bv = b[0];
+                        for (o, &av) in output.iter_mut().zip(a.iter()) {
+                            *o = av / bv;
+                        }
+                    } else {
+                        let c = b.len();
+                        for (i, (o, &av)) in output.iter_mut().zip(a.iter()).enumerate() {
+                            *o = av / b[i % c];
+                        }
+                    }
+                }
+                Dtype::F16 => {
+                    let a = unsafe { (*a_ptr).as_f16() };
+                    let b = unsafe { (*b_ptr).as_f16() };
+                    let output = unsafe { (*out_ptr).as_f16_mut() };
+                    
+                    if a.len() == b.len() {
+                        ops::div_fp16(output, a, b);
+                    } else {
+                        let c = b.len();
+                        for (i, (o, av)) in output.iter_mut().zip(a.iter()).enumerate() {
+                            *o = F16::from_f32(av.to_f32() / b[i % c].to_f32());
+                        }
+                    }
+                }
+                _ => return Err(Error::Runtime("unsupported dtype for div".into())),
             }
             Ok(())
         }
