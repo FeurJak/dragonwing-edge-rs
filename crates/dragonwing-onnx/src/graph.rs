@@ -208,6 +208,149 @@ pub fn compile_model(model: &Model, dtype: Dtype) -> Result<Graph> {
     })
 }
 
+/// Convert a compiled graph from NCHW to NHWC layout.
+///
+/// ONNX models typically use NCHW format, but dragonwing kernels use NHWC
+/// for efficient memory access on the target hardware.
+///
+/// The conversion:
+/// - Transposes 4D activation shapes from [N,C,H,W] to [N,H,W,C]
+/// - Transposes Conv weight data from [C_out,C_in,kH,kW] to [C_out,kH,kW,C_in]
+/// - The caller must transpose input data NCHW→NHWC before feeding to the graph
+/// - The caller must transpose output data NHWC→NCHW after getting results
+pub fn convert_nchw_to_nhwc(graph: &mut Graph) -> Result<()> {
+    // First, identify which tensors are Conv weights (they have 4D shapes and are initializers)
+    let mut conv_weight_names: Vec<String> = Vec::new();
+    for op in &graph.ops {
+        if op.op_type == "Conv" && !op.inputs.is_empty() && op.inputs.len() >= 2 {
+            // inputs[1] is the weight tensor
+            let weight_name = &op.inputs[1];
+            if graph.initializers.contains_key(weight_name) {
+                conv_weight_names.push(weight_name.clone());
+            }
+        }
+    }
+    
+    // Transpose Conv weight initializers: [C_out, C_in, kH, kW] → [C_out, kH, kW, C_in]
+    for weight_name in &conv_weight_names {
+        if let Some(shape) = graph.shapes.get(weight_name) {
+            if shape.dims.len() == 4 {
+                let orig_shape = shape.dims.clone();  // [C_out, C_in, kH, kW]
+                
+                if let Some(data) = graph.initializers.get_mut(weight_name) {
+                    // Transpose data: perm [0, 2, 3, 1]
+                    *data = transpose_f32_4d(data, &orig_shape, &[0, 2, 3, 1]);
+                }
+                
+                // Update shape: [C_out, C_in, kH, kW] → [C_out, kH, kW, C_in]
+                if let Some(s) = graph.shapes.get_mut(weight_name) {
+                    s.dims = vec![orig_shape[0], orig_shape[2], orig_shape[3], orig_shape[1]];
+                }
+            }
+        }
+    }
+    
+    // Convert all non-weight 4D activation shapes from NCHW to NHWC
+    let weight_set: std::collections::HashSet<_> = conv_weight_names.iter().collect();
+    for (name, shape) in graph.shapes.iter_mut() {
+        if shape.dims.len() == 4 && !weight_set.contains(name) {
+            let [n, c, h, w] = [shape.dims[0], shape.dims[1], shape.dims[2], shape.dims[3]];
+            shape.dims = vec![n, h, w, c];
+        }
+    }
+    
+    Ok(())
+}
+
+/// Transpose a 4D F32 tensor.
+/// 
+/// `perm` specifies the permutation: for output index [i,j,k,l],
+/// read from input at [perm[0]->i, perm[1]->j, ...]
+fn transpose_f32_4d(data: &[u8], shape: &[usize], perm: &[usize; 4]) -> Vec<u8> {
+    let numel: usize = shape.iter().product();
+    if data.len() != numel * 4 {
+        return data.to_vec();  // Size mismatch, return as-is
+    }
+    
+    let src: Vec<f32> = data.chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    
+    let [d0, d1, d2, d3] = [shape[0], shape[1], shape[2], shape[3]];
+    let out_shape = [shape[perm[0]], shape[perm[1]], shape[perm[2]], shape[perm[3]]];
+    
+    let mut dst = vec![0.0f32; numel];
+    
+    for i0 in 0..d0 {
+        for i1 in 0..d1 {
+            for i2 in 0..d2 {
+                for i3 in 0..d3 {
+                    // Source index in original layout
+                    let src_idx = ((i0 * d1 + i1) * d2 + i2) * d3 + i3;
+                    
+                    // Destination indices after permutation
+                    let indices = [i0, i1, i2, i3];
+                    let mut out_idx = [0usize; 4];
+                    for (out_dim, &src_dim) in perm.iter().enumerate() {
+                        out_idx[out_dim] = indices[src_dim];
+                    }
+                    
+                    let dst_idx = ((out_idx[0] * out_shape[1] + out_idx[1]) * out_shape[2] + out_idx[2]) * out_shape[3] + out_idx[3];
+                    dst[dst_idx] = src[src_idx];
+                }
+            }
+        }
+    }
+    
+    dst.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Transpose input data from NCHW to NHWC format.
+/// 
+/// Call this on input data before feeding to a graph that was converted
+/// with `convert_nchw_to_nhwc`.
+pub fn transpose_nchw_to_nhwc(data: &[f32], shape: &[usize; 4]) -> Vec<f32> {
+    let [n, c, h, w] = *shape;
+    let mut out = vec![0.0f32; n * h * w * c];
+    
+    for ni in 0..n {
+        for ci in 0..c {
+            for hi in 0..h {
+                for wi in 0..w {
+                    let src_idx = ((ni * c + ci) * h + hi) * w + wi;
+                    let dst_idx = ((ni * h + hi) * w + wi) * c + ci;
+                    out[dst_idx] = data[src_idx];
+                }
+            }
+        }
+    }
+    
+    out
+}
+
+/// Transpose output data from NHWC back to NCHW format.
+/// 
+/// Call this on output data after getting results from a graph that was
+/// converted with `convert_nchw_to_nhwc`.
+pub fn transpose_nhwc_to_nchw(data: &[f32], shape: &[usize; 4]) -> Vec<f32> {
+    let [n, h, w, c] = *shape;  // NHWC shape
+    let mut out = vec![0.0f32; n * c * h * w];
+    
+    for ni in 0..n {
+        for hi in 0..h {
+            for wi in 0..w {
+                for ci in 0..c {
+                    let src_idx = ((ni * h + hi) * w + wi) * c + ci;
+                    let dst_idx = ((ni * c + ci) * h + hi) * w + wi;
+                    out[dst_idx] = data[src_idx];
+                }
+            }
+        }
+    }
+    
+    out
+}
+
 /// Convert ONNX DataType to dragonwing Dtype.
 fn onnx_dtype_to_dragonwing(onnx_dtype: DataType, default: Dtype) -> Dtype {
     match onnx_dtype {
@@ -522,5 +665,61 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].0, "output");
         assert_eq!(outputs[0].1.dims, vec![1, 1000]);
+    }
+
+    #[test]
+    #[ignore] // Requires artifacts/models/mobilenetv2-12.onnx
+    fn test_compile_mobilenetv2_nhwc() {
+        let model_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../artifacts/models/mobilenetv2-12.onnx");
+        let bytes = std::fs::read(model_path).expect("Failed to read model file");
+        let model = crate::model::parse_model(&bytes).expect("Failed to parse model");
+        
+        let mut graph = compile_model(&model, Dtype::F32).expect("Failed to compile model");
+        
+        // Convert to NHWC
+        convert_nchw_to_nhwc(&mut graph).expect("Failed to convert to NHWC");
+        
+        println!("Compiled graph (NHWC):");
+        println!("  Ops: {}", graph.num_ops());
+        println!("  Inputs: {:?}", graph.input_info());
+        println!("  Outputs: {:?}", graph.output_info());
+        
+        // Check converted shapes
+        let inputs = graph.input_info();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].0, "input");
+        // Input should now be NHWC: [1, 224, 224, 3]
+        assert_eq!(inputs[0].1.dims, vec![1, 224, 224, 3]);
+        
+        // Output is 2D, should be unchanged
+        let outputs = graph.output_info();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].0, "output");
+        assert_eq!(outputs[0].1.dims, vec![1, 1000]);
+    }
+
+    #[test]
+    fn test_transpose_nchw_nhwc() {
+        // Test small tensor: 1x2x2x3 in NCHW
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let shape = [1, 2, 2, 3];  // [N=1, C=2, H=2, W=3]
+        
+        let transposed = transpose_nchw_to_nhwc(&data, &shape);
+        
+        // Expected: [N=1, H=2, W=3, C=2]
+        // In NCHW: data[n,c,h,w] at index n*C*H*W + c*H*W + h*W + w
+        // In NHWC: data[n,h,w,c] at index n*H*W*C + h*W*C + w*C + c
+        
+        // NCHW index (0,0,0,0) -> 0  => NHWC index (0,0,0,0) -> 0
+        // NCHW index (0,0,0,1) -> 1  => NHWC index (0,0,1,0) -> 2  
+        // NCHW index (0,1,0,0) -> 6  => NHWC index (0,0,0,1) -> 1
+        
+        // At NHWC [0,0,0,:] we should have NCHW [0,:,0,0] = [0, 6]
+        assert_eq!(transposed[0], 0.0);  // NHWC [0,0,0,0]
+        assert_eq!(transposed[1], 6.0);  // NHWC [0,0,0,1]
+        
+        // At NHWC [0,0,1,:] we should have NCHW [0,:,0,1] = [1, 7]
+        assert_eq!(transposed[2], 1.0);  // NHWC [0,0,1,0]
+        assert_eq!(transposed[3], 7.0);  // NHWC [0,0,1,1]
     }
 }

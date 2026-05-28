@@ -52,7 +52,7 @@ mod runtime;
 pub use error::{Error, Result};
 pub use model::{Model, OnnxNode, OnnxTensor, OnnxAttribute, AttributeValue, DataType};
 pub use builder::{OpBuilder, BuildContext, UnsupportedReason, ValidationReport, TensorShape, CompiledOp, OpParams};
-pub use graph::{Graph, validate_model, compile_model, fold_batchnorm};
+pub use graph::{Graph, validate_model, compile_model, fold_batchnorm, convert_nchw_to_nhwc, transpose_nchw_to_nhwc, transpose_nhwc_to_nchw};
 pub use runtime::GraphRuntime;
 
 /// CPU-optimized graph runtime (requires `cpu` feature).
