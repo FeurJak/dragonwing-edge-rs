@@ -193,8 +193,35 @@ pub fn compile_model(model: &Model, dtype: Dtype) -> Result<Graph> {
         .map(|o| o.name.clone())
         .collect();
 
-    // Collect initializer data
+    // Collect all tensor names actually used by ops
+    let mut used_tensors: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for op in &ops {
+        for input in &op.inputs {
+            used_tensors.insert(input.clone());
+        }
+        for output in &op.outputs {
+            used_tensors.insert(output.clone());
+        }
+    }
+    // Also include graph outputs
+    for output in &graph_outputs {
+        used_tensors.insert(output.clone());
+    }
+
+    // Collect initializer data only for tensors that are actually used
+    // and that are F32 or F16 (skip INT64 shape tensors that are constant-folded)
     let initializer_data: HashMap<String, Vec<u8>> = model.initializers.iter()
+        .filter(|t| {
+            // Only include if it's actually used by an op
+            if !used_tensors.contains(&t.name) {
+                return false;
+            }
+            // Skip INT64 initializers - they're shape tensors for constant folding
+            if t.data_type == DataType::Int64 {
+                return false;
+            }
+            true
+        })
         .map(|t| (t.name.clone(), t.data.clone()))
         .collect();
 
@@ -231,20 +258,20 @@ pub fn convert_nchw_to_nhwc(graph: &mut Graph) -> Result<()> {
         }
     }
     
-    // Transpose Conv weight initializers: [C_out, C_in, kH, kW] → [C_out, kH, kW, C_in]
+    // Transpose Conv weight initializers: [C_out, C_in, kH, kW] → [kH, kW, C_in, C_out]
     for weight_name in &conv_weight_names {
         if let Some(shape) = graph.shapes.get(weight_name) {
             if shape.dims.len() == 4 {
                 let orig_shape = shape.dims.clone();  // [C_out, C_in, kH, kW]
                 
                 if let Some(data) = graph.initializers.get_mut(weight_name) {
-                    // Transpose data: perm [0, 2, 3, 1]
-                    *data = transpose_f32_4d(data, &orig_shape, &[0, 2, 3, 1]);
+                    // Transpose data: perm [2, 3, 1, 0] to get [kH, kW, C_in, C_out]
+                    *data = transpose_f32_4d(data, &orig_shape, &[2, 3, 1, 0]);
                 }
                 
-                // Update shape: [C_out, C_in, kH, kW] → [C_out, kH, kW, C_in]
+                // Update shape: [C_out, C_in, kH, kW] → [kH, kW, C_in, C_out]
                 if let Some(s) = graph.shapes.get_mut(weight_name) {
-                    s.dims = vec![orig_shape[0], orig_shape[2], orig_shape[3], orig_shape[1]];
+                    s.dims = vec![orig_shape[2], orig_shape[3], orig_shape[1], orig_shape[0]];
                 }
             }
         }

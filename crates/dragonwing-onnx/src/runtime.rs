@@ -785,7 +785,14 @@ mod cpu_runtime {
                         }
                         _ => data.clone(),
                     };
-                    buffer.as_bytes_mut().copy_from_slice(&upload_data);
+                    let buf_bytes = buffer.as_bytes_mut();
+                    if buf_bytes.len() != upload_data.len() {
+                        return Err(Error::Runtime(format!(
+                            "initializer size mismatch for {name}: buffer={} bytes, data={} bytes, shape={:?}",
+                            buf_bytes.len(), upload_data.len(), shape
+                        )));
+                    }
+                    buf_bytes.copy_from_slice(&upload_data);
                 }
             }
 
@@ -1345,8 +1352,15 @@ mod cpu_runtime {
                 None
             };
 
-            if group != 1 {
-                return Err(Error::Runtime("grouped convolution not yet supported".into()));
+            // Determine if this is a depthwise convolution (group == c_in)
+            let is_depthwise = group == c_in && group > 1;
+            let channel_multiplier = if is_depthwise { c_out / c_in } else { 1 };
+
+            if group != 1 && !is_depthwise {
+                return Err(Error::Runtime(format!(
+                    "general grouped convolution not yet supported (group={}, c_in={})",
+                    group, c_in
+                )));
             }
 
             match self.graph.dtype {
@@ -1355,12 +1369,21 @@ mod cpu_runtime {
                     let weight = unsafe { (*weight_ptr).as_f32() };
                     let output = unsafe { (*output_ptr).as_f32_mut() };
 
-                    ops::conv2d_f32_nhwc_mt(
-                        output, input, weight,
-                        n, h_in, w_in, c_in, c_out,
-                        k_h, k_w, strides[0], strides[1], pad_h, pad_w,
-                        self.num_threads
-                    );
+                    if is_depthwise {
+                        ops::depthwise_conv2d_f32_nhwc_mt(
+                            output, input, weight,
+                            n, h_in, w_in, c_in, channel_multiplier,
+                            k_h, k_w, strides[0], strides[1], pad_h, pad_w,
+                            self.num_threads
+                        );
+                    } else {
+                        ops::conv2d_f32_nhwc_mt(
+                            output, input, weight,
+                            n, h_in, w_in, c_in, c_out,
+                            k_h, k_w, strides[0], strides[1], pad_h, pad_w,
+                            self.num_threads
+                        );
+                    }
 
                     // Add bias if present
                     if let Some(bias_p) = bias_ptr {
@@ -1384,12 +1407,21 @@ mod cpu_runtime {
                     let weight = unsafe { (*weight_ptr).as_f16() };
                     let output = unsafe { (*output_ptr).as_f16_mut() };
 
-                    ops::conv2d_fp16_nhwc_mt(
-                        output, input, weight,
-                        n, h_in, w_in, c_in, c_out,
-                        k_h, k_w, strides[0], strides[1], pad_h, pad_w,
-                        self.num_threads
-                    );
+                    if is_depthwise {
+                        ops::depthwise_conv2d_fp16_nhwc_mt(
+                            output, input, weight,
+                            n, h_in, w_in, c_in, channel_multiplier,
+                            k_h, k_w, strides[0], strides[1], pad_h, pad_w,
+                            self.num_threads
+                        );
+                    } else {
+                        ops::conv2d_fp16_nhwc_mt(
+                            output, input, weight,
+                            n, h_in, w_in, c_in, c_out,
+                            k_h, k_w, strides[0], strides[1], pad_h, pad_w,
+                            self.num_threads
+                        );
+                    }
 
                     if let Some(bias_p) = bias_ptr {
                         let bias = unsafe { (*bias_p).as_f16() };
@@ -1582,6 +1614,87 @@ mod tests {
         
         for (orig, converted) in f32_data.iter().zip(result.iter()) {
             assert!((orig - converted).abs() < 0.01);
+        }
+    }
+
+    #[cfg(feature = "cpu")]
+    mod cpu_tests {
+        use super::*;
+        use crate::graph::{compile_model, convert_nchw_to_nhwc, transpose_nchw_to_nhwc};
+        use dragonwing_core::Dtype;
+
+        #[test]
+        #[ignore] // Requires artifacts/models/mobilenetv2-12.onnx
+        fn test_mobilenetv2_inference() {
+            // Load model
+            let model_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../artifacts/models/mobilenetv2-12.onnx");
+            let bytes = std::fs::read(model_path).expect("Failed to read model file");
+            let model = crate::model::parse_model(&bytes).expect("Failed to parse model");
+            
+            // Compile and convert to NHWC
+            let mut graph = compile_model(&model, Dtype::F32).expect("Failed to compile model");
+            convert_nchw_to_nhwc(&mut graph).expect("Failed to convert to NHWC");
+            
+            println!("Graph compiled:");
+            println!("  Inputs: {:?}", graph.input_info());
+            println!("  Outputs: {:?}", graph.output_info());
+            
+            // Create runtime
+            let mut runtime = CpuGraphRuntime::new(graph).expect("Failed to create runtime");
+            
+            // Load input (NCHW format from file)
+            let input_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../artifacts/models/mobilenetv2-12.input.bin");
+            let input_bytes = std::fs::read(input_path).expect("Failed to read input file");
+            let input_nchw: Vec<f32> = input_bytes.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            
+            // Convert input to NHWC
+            let input_nhwc = transpose_nchw_to_nhwc(&input_nchw, &[1, 3, 224, 224]);
+            
+            println!("Input loaded: {} elements", input_nhwc.len());
+            println!("  First 5 values: {:?}", &input_nhwc[..5.min(input_nhwc.len())]);
+            
+            // Set input
+            runtime.set_input_f32("input", &input_nhwc).expect("Failed to set input");
+            
+            // Run inference
+            println!("Running inference...");
+            let start = std::time::Instant::now();
+            runtime.run().expect("Inference failed");
+            let elapsed = start.elapsed();
+            println!("Inference completed in {:?}", elapsed);
+            
+            // Get output
+            let output = runtime.get_output_f32("output").expect("Failed to get output");
+            println!("Output shape: {} elements", output.len());
+            
+            // Find top-5 predictions
+            let mut indexed: Vec<(usize, f32)> = output.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top5: Vec<(usize, f32)> = indexed.into_iter().take(5).collect();
+            
+            println!("\nTop-5 predictions:");
+            for (i, (class_id, logit)) in top5.iter().enumerate() {
+                println!("  {}. Class {}: logit={:.4}", i + 1, class_id, logit);
+            }
+            
+            // Load reference
+            let ref_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../artifacts/models/mobilenetv2-12.reference.json");
+            let ref_json = std::fs::read_to_string(ref_path).expect("Failed to read reference");
+            
+            // Parse expected top-5 classes (simple JSON parsing)
+            // Expected: "top5_classes": [549, 418, 645, 954, 818]
+            let expected_classes: Vec<usize> = vec![549, 418, 645, 954, 818];
+            
+            println!("\nExpected top-5 classes: {:?}", expected_classes);
+            println!("Actual top-5 classes: {:?}", top5.iter().map(|(c, _)| c).collect::<Vec<_>>());
+            
+            // Check if top-1 matches
+            assert_eq!(top5[0].0, expected_classes[0], 
+                "Top-1 class mismatch: expected {}, got {}", expected_classes[0], top5[0].0);
+            
+            println!("\n✓ Top-1 class matches reference!");
         }
     }
 }

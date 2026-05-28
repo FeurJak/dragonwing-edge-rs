@@ -1450,3 +1450,285 @@ pub fn conv2d_fp16_nhwc_mt(
         }
     });
 }
+
+// ===========================================================================
+// Depthwise Convolution (group == c_in)
+// ===========================================================================
+
+/// Depthwise 2D convolution in NHWC format (group == c_in).
+///
+/// Each input channel has its own filter (or `channel_multiplier` filters).
+/// For MobileNet, channel_multiplier is typically 1.
+///
+/// * Input: `[N, H_in, W_in, C_in]` in NHWC format
+/// * Kernel: `[k_h, k_w, C_in, channel_multiplier]`
+/// * Output: `[N, H_out, W_out, C_in * channel_multiplier]`
+///
+/// When `channel_multiplier == 1`, this is a standard depthwise conv where
+/// `c_out == c_in`.
+#[allow(clippy::too_many_arguments)]
+pub fn depthwise_conv2d_f32_nhwc(
+    output: &mut [f32],
+    input: &[f32],
+    kernel: &[f32],
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    channel_multiplier: usize,
+    k_h: usize,
+    k_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) {
+    let c_out = c_in * channel_multiplier;
+    let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+    let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+
+    assert_eq!(input.len(), n * h_in * w_in * c_in);
+    assert_eq!(kernel.len(), k_h * k_w * c_in * channel_multiplier);
+    assert_eq!(output.len(), n * h_out * w_out * c_out);
+
+    for batch in 0..n {
+        for oh in 0..h_out {
+            for ow in 0..w_out {
+                for ic in 0..c_in {
+                    for m in 0..channel_multiplier {
+                        let oc = ic * channel_multiplier + m;
+                        let mut acc: f32 = 0.0;
+
+                        for kh in 0..k_h {
+                            for kw in 0..k_w {
+                                let ih = (oh * stride_h + kh) as isize - pad_h as isize;
+                                let iw = (ow * stride_w + kw) as isize - pad_w as isize;
+
+                                if ih < 0 || ih >= h_in as isize || iw < 0 || iw >= w_in as isize {
+                                    continue;
+                                }
+
+                                let ih = ih as usize;
+                                let iw = iw as usize;
+
+                                // Input index: [batch, ih, iw, ic]
+                                let input_idx = ((batch * h_in + ih) * w_in + iw) * c_in + ic;
+                                // Kernel index: [kh, kw, ic, m]
+                                let kernel_idx = ((kh * k_w + kw) * c_in + ic) * channel_multiplier + m;
+
+                                acc = input[input_idx].mul_add(kernel[kernel_idx], acc);
+                            }
+                        }
+
+                        // Output index: [batch, oh, ow, oc]
+                        let output_idx = ((batch * h_out + oh) * w_out + ow) * c_out + oc;
+                        output[output_idx] = acc;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Multi-threaded depthwise 2D convolution in NHWC format.
+#[allow(clippy::too_many_arguments)]
+pub fn depthwise_conv2d_f32_nhwc_mt(
+    output: &mut [f32],
+    input: &[f32],
+    kernel: &[f32],
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    channel_multiplier: usize,
+    k_h: usize,
+    k_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+    num_threads: usize,
+) {
+    let c_out = c_in * channel_multiplier;
+    let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+    let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+
+    assert_eq!(input.len(), n * h_in * w_in * c_in);
+    assert_eq!(kernel.len(), k_h * k_w * c_in * channel_multiplier);
+    assert_eq!(output.len(), n * h_out * w_out * c_out);
+
+    let total_work = n * h_out * w_out * c_out * k_h * k_w;
+    if total_work < 4096 || num_threads <= 1 {
+        depthwise_conv2d_f32_nhwc(output, input, kernel, n, h_in, w_in, c_in, channel_multiplier,
+            k_h, k_w, stride_h, stride_w, pad_h, pad_w);
+        return;
+    }
+
+    let num_threads = num_threads.min(n * h_out).min(num_cpus());
+
+    let output_ptr = unsafe { SendPtr::new(output.as_mut_ptr()) };
+    let input_ptr = unsafe { SendPtr::from_const(input.as_ptr()) };
+    let kernel_ptr = unsafe { SendPtr::from_const(kernel.as_ptr()) };
+
+    let total_rows = n * h_out;
+
+    parallel_for_scoped(num_threads, total_rows, |row_start, row_end| {
+        unsafe {
+            for row_idx in row_start..row_end {
+                let batch = row_idx / h_out;
+                let oh = row_idx % h_out;
+
+                for ow in 0..w_out {
+                    for ic in 0..c_in {
+                        for m in 0..channel_multiplier {
+                            let oc = ic * channel_multiplier + m;
+                            let mut acc: f32 = 0.0;
+
+                            for kh in 0..k_h {
+                                for kw in 0..k_w {
+                                    let ih = (oh * stride_h + kh) as isize - pad_h as isize;
+                                    let iw = (ow * stride_w + kw) as isize - pad_w as isize;
+
+                                    if ih < 0 || ih >= h_in as isize || iw < 0 || iw >= w_in as isize {
+                                        continue;
+                                    }
+
+                                    let ih = ih as usize;
+                                    let iw = iw as usize;
+
+                                    let input_idx = ((batch * h_in + ih) * w_in + iw) * c_in + ic;
+                                    let kernel_idx = ((kh * k_w + kw) * c_in + ic) * channel_multiplier + m;
+
+                                    let i_val = *input_ptr.as_const_ptr().add(input_idx);
+                                    let k_val = *kernel_ptr.as_const_ptr().add(kernel_idx);
+                                    acc = i_val.mul_add(k_val, acc);
+                                }
+                            }
+
+                            let output_idx = ((batch * h_out + oh) * w_out + ow) * c_out + oc;
+                            *output_ptr.as_ptr().add(output_idx) = acc;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Depthwise 2D convolution in NHWC format with F16 data.
+#[allow(clippy::too_many_arguments)]
+pub fn depthwise_conv2d_fp16_nhwc_mt(
+    output: &mut [F16],
+    input: &[F16],
+    kernel: &[F16],
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    channel_multiplier: usize,
+    k_h: usize,
+    k_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+    num_threads: usize,
+) {
+    let c_out = c_in * channel_multiplier;
+    let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+    let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+
+    assert_eq!(input.len(), n * h_in * w_in * c_in);
+    assert_eq!(kernel.len(), k_h * k_w * c_in * channel_multiplier);
+    assert_eq!(output.len(), n * h_out * w_out * c_out);
+
+    let total_work = n * h_out * w_out * c_out * k_h * k_w;
+    if total_work < 4096 || num_threads <= 1 {
+        // Inline single-threaded version
+        for batch in 0..n {
+            for oh in 0..h_out {
+                for ow in 0..w_out {
+                    for ic in 0..c_in {
+                        for m in 0..channel_multiplier {
+                            let oc = ic * channel_multiplier + m;
+                            let mut acc: f32 = 0.0;
+
+                            for kh in 0..k_h {
+                                for kw in 0..k_w {
+                                    let ih = (oh * stride_h + kh) as isize - pad_h as isize;
+                                    let iw = (ow * stride_w + kw) as isize - pad_w as isize;
+
+                                    if ih < 0 || ih >= h_in as isize || iw < 0 || iw >= w_in as isize {
+                                        continue;
+                                    }
+
+                                    let ih = ih as usize;
+                                    let iw = iw as usize;
+
+                                    let input_idx = ((batch * h_in + ih) * w_in + iw) * c_in + ic;
+                                    let kernel_idx = ((kh * k_w + kw) * c_in + ic) * channel_multiplier + m;
+
+                                    acc = input[input_idx].to_f32().mul_add(kernel[kernel_idx].to_f32(), acc);
+                                }
+                            }
+
+                            let output_idx = ((batch * h_out + oh) * w_out + ow) * c_out + oc;
+                            output[output_idx] = F16::from_f32(acc);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    let num_threads = num_threads.min(n * h_out).min(num_cpus());
+
+    let output_ptr = unsafe { SendPtr::new(output.as_mut_ptr()) };
+    let input_ptr = unsafe { SendPtr::from_const(input.as_ptr()) };
+    let kernel_ptr = unsafe { SendPtr::from_const(kernel.as_ptr()) };
+
+    let total_rows = n * h_out;
+
+    parallel_for_scoped(num_threads, total_rows, |row_start, row_end| {
+        unsafe {
+            for row_idx in row_start..row_end {
+                let batch = row_idx / h_out;
+                let oh = row_idx % h_out;
+
+                for ow in 0..w_out {
+                    for ic in 0..c_in {
+                        for m in 0..channel_multiplier {
+                            let oc = ic * channel_multiplier + m;
+                            let mut acc: f32 = 0.0;
+
+                            for kh in 0..k_h {
+                                for kw in 0..k_w {
+                                    let ih = (oh * stride_h + kh) as isize - pad_h as isize;
+                                    let iw = (ow * stride_w + kw) as isize - pad_w as isize;
+
+                                    if ih < 0 || ih >= h_in as isize || iw < 0 || iw >= w_in as isize {
+                                        continue;
+                                    }
+
+                                    let ih = ih as usize;
+                                    let iw = iw as usize;
+
+                                    let input_idx = ((batch * h_in + ih) * w_in + iw) * c_in + ic;
+                                    let kernel_idx = ((kh * k_w + kw) * c_in + ic) * channel_multiplier + m;
+
+                                    let i_f32 = (*input_ptr.as_const_ptr().add(input_idx)).to_f32();
+                                    let k_f32 = (*kernel_ptr.as_const_ptr().add(kernel_idx)).to_f32();
+                                    acc = i_f32.mul_add(k_f32, acc);
+                                }
+                            }
+
+                            let output_idx = ((batch * h_out + oh) * w_out + ow) * c_out + oc;
+                            *output_ptr.as_ptr().add(output_idx) = F16::from_f32(acc);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
