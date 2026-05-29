@@ -757,33 +757,141 @@ impl VulkanGraphRuntime {
             .map_err(|e| Error::Runtime(format!("vk softmax_f32: {e}")))
     }
 
-    fn dispatch_requantize(&mut self, _op: &CompiledOp, _scale: f32) -> Result<()> {
-        Err(Error::Runtime(
-            "Vulkan requantize not wired yet — Phase 3".into(),
-        ))
+    // =========================================================================
+    // Phase 3 dispatchers — INT8 packed ops.
+    // =========================================================================
+    //
+    // INT8 ops use UINT32 packing (4× I8 per U32). Tensor sizes are derived
+    // from `graph.shapes` via `numel()`. The buffer for a packed I8 tensor
+    // has byte length == `numel()` (1 byte per element). The buffer for an
+    // INT32 accumulator has byte length == `numel() * 4`.
+
+    fn dispatch_requantize(&mut self, op: &CompiledOp, scale: f32) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("requantize: missing input/output".into()));
+        }
+        let in_name = op.inputs[0].clone();
+        let out_name = op.outputs[0].clone();
+        if in_name == out_name {
+            return Err(Error::Runtime("requantize: in-place not supported".into()));
+        }
+        let (input, output) = Self::get_two_buffers(&mut self.buffers, &in_name, &out_name)?;
+        dragonwing_vulkan::ops::requantize_i32_to_i8_packed(&self.backend, input, output, scale)
+            .map_err(|e| Error::Runtime(format!("vk requantize: {e}")))
     }
 
     fn dispatch_add_quantized(
         &mut self,
-        _op: &CompiledOp,
-        _scale_a_over_out: f32,
-        _scale_b_over_out: f32,
+        op: &CompiledOp,
+        scale_a_over_out: f32,
+        scale_b_over_out: f32,
     ) -> Result<()> {
-        Err(Error::Runtime(
-            "Vulkan add_quantized not wired yet — Phase 3".into(),
-        ))
+        if op.inputs.len() < 2 || op.outputs.is_empty() {
+            return Err(Error::Runtime("add_q: needs 2 inputs + 1 output".into()));
+        }
+        let (a, b, y) =
+            Self::get_three_buffers(&mut self.buffers, &op.inputs[0], &op.inputs[1], &op.outputs[0])?;
+        dragonwing_vulkan::ops::add_i8_packed(
+            &self.backend,
+            a,
+            b,
+            y,
+            scale_a_over_out,
+            scale_b_over_out,
+        )
+        .map_err(|e| Error::Runtime(format!("vk add_i8: {e}")))
     }
 
-    fn dispatch_quantize(&mut self, _op: &CompiledOp, _scale: f32) -> Result<()> {
-        Err(Error::Runtime(
-            "Vulkan quantize not wired yet — Phase 3".into(),
-        ))
+    fn dispatch_quantize(&mut self, op: &CompiledOp, scale: f32) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("quantize: missing input/output".into()));
+        }
+        let in_name = op.inputs[0].clone();
+        let out_name = op.outputs[0].clone();
+        if in_name == out_name {
+            return Err(Error::Runtime("quantize: in-place not supported".into()));
+        }
+        let (input, output) = Self::get_two_buffers(&mut self.buffers, &in_name, &out_name)?;
+        dragonwing_vulkan::ops::quantize_f32_to_i8_packed(&self.backend, input, output, scale)
+            .map_err(|e| Error::Runtime(format!("vk quantize: {e}")))
     }
 
-    fn dispatch_dequantize(&mut self, _op: &CompiledOp, _scale: f32) -> Result<()> {
-        Err(Error::Runtime(
-            "Vulkan dequantize not wired yet — Phase 3".into(),
-        ))
+    fn dispatch_dequantize(&mut self, op: &CompiledOp, scale: f32) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("dequantize: missing input/output".into()));
+        }
+        let in_name = op.inputs[0].clone();
+        let out_name = op.outputs[0].clone();
+        if in_name == out_name {
+            return Err(Error::Runtime("dequantize: in-place not supported".into()));
+        }
+        let (input, output) = Self::get_two_buffers(&mut self.buffers, &in_name, &out_name)?;
+        dragonwing_vulkan::ops::dequantize_i8_packed_to_f32(&self.backend, input, output, scale)
+            .map_err(|e| Error::Runtime(format!("vk dequantize: {e}")))
+    }
+
+    /// INT8 ReLU on packed tensors. Not in `OpParams` directly — exposed via a
+    /// helper for ops that combine ReLU with another quantized step. Phase 3
+    /// includes it for testing.
+    #[allow(dead_code)]
+    fn dispatch_relu_i8(&mut self, in_name: &str, out_name: &str) -> Result<()> {
+        if in_name == out_name {
+            return Err(Error::Runtime("relu_i8: in-place not supported".into()));
+        }
+        let (input, output) = Self::get_two_buffers(&mut self.buffers, in_name, out_name)?;
+        dragonwing_vulkan::ops::relu_i8_packed(&self.backend, input, output)
+            .map_err(|e| Error::Runtime(format!("vk relu_i8: {e}")))
+    }
+
+    /// Vulkan-side INT8 GEMM (low-level helper, not used by graph dispatch).
+    /// Useful for parity tests that build packed buffers directly.
+    #[allow(dead_code)]
+    fn dispatch_gemm_i8(
+        &mut self,
+        a_name: &str,
+        b_name: &str,
+        c_name: &str,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let (a, b, c) = Self::get_three_buffers(&mut self.buffers, a_name, b_name, c_name)?;
+        dragonwing_vulkan::ops::gemm_i8_packed(&self.backend, a, b, c, m, n, k)
+            .map_err(|e| Error::Runtime(format!("vk gemm_i8: {e}")))
+    }
+
+    /// Set a Vulkan buffer by raw bytes (Phase 3 helper for INT8 testing).
+    ///
+    /// Bypasses dtype conversion; the caller is responsible for matching the
+    /// buffer's byte length exactly.
+    pub fn set_input_bytes(&mut self, name: &str, data: &[u8]) -> Result<()> {
+        let buffer = self
+            .buffers
+            .get_mut(name)
+            .ok_or_else(|| Error::Runtime(format!("buffer not found: {name}")))?;
+        if buffer.len_bytes() != data.len() {
+            return Err(Error::Runtime(format!(
+                "set_input_bytes {name}: size mismatch buffer={} bytes, data={} bytes",
+                buffer.len_bytes(),
+                data.len(),
+            )));
+        }
+        self.backend
+            .upload(buffer, data)
+            .map_err(|e| Error::Runtime(format!("upload {name}: {e}")))
+    }
+
+    /// Read a Vulkan buffer's raw bytes (Phase 3 helper for INT8 testing).
+    pub fn get_output_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        let buffer = self
+            .buffers
+            .get(name)
+            .ok_or_else(|| Error::Runtime(format!("buffer not found: {name}")))?;
+        let mut out = vec![0u8; buffer.len_bytes()];
+        self.backend
+            .download(buffer, &mut out)
+            .map_err(|e| Error::Runtime(format!("download {name}: {e}")))?;
+        Ok(out)
     }
 }
 
@@ -1009,6 +1117,197 @@ mod tests {
             initializers: HashMap::new(),
             dtype: Dtype::F32,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 tests: INT8 packed op dispatch
+    // -----------------------------------------------------------------------
+
+    /// Pack `i8` slice into little-endian UINT32s as bytes (4× I8 → 1× U32).
+    fn pack_i8_bytes(values: &[i8]) -> Vec<u8> {
+        // `as u8` gives the two's-complement byte representation, which
+        // matches the shader's `int(packed & 0xFF) - (if >= 128) 256` decoding.
+        values.iter().map(|&v| v as u8).collect()
+    }
+
+    /// Build a graph that just quantizes F32 to I8 packed.
+    fn quantize_graph() -> Graph {
+        let mut shapes = HashMap::new();
+        // Note: dtype on the graph as a whole still drives buffer allocation.
+        // For mixed-dtype graphs we set per-tensor shapes accordingly.
+        shapes.insert("x_f32".into(), TensorShape::new(vec![16], Dtype::F32));
+        shapes.insert("x_i8".into(), TensorShape::new(vec![16], Dtype::I8));
+        let ops = vec![CompiledOp {
+            name: "q1".into(),
+            op_type: "Quantize".into(),
+            inputs: vec!["x_f32".into()],
+            outputs: vec!["x_i8".into()],
+            params: OpParams::Quantize { scale: 0.1 },
+        }];
+        Graph {
+            ops,
+            shapes,
+            inputs: vec!["x_f32".into()],
+            outputs: vec!["x_i8".into()],
+            initializers: HashMap::new(),
+            // Even for a mixed-dtype graph we have to pick a "primary" dtype;
+            // F32 makes set_input_f32 use the right path for the F32 input.
+            dtype: Dtype::F32,
+        }
+    }
+
+    #[test]
+    fn quantize_roundtrip_via_dequantize() {
+        let Some(backend) = try_make_backend() else {
+            eprintln!("skipping: no Vulkan device available");
+            return;
+        };
+
+        // We build a Q → DQ chain manually since the graph types don't yet
+        // model two-shape graphs cleanly.
+        let mut shapes = HashMap::new();
+        shapes.insert("x_f32".into(), TensorShape::new(vec![16], Dtype::F32));
+        shapes.insert("x_i8".into(), TensorShape::new(vec![16], Dtype::I8));
+        shapes.insert("y_f32".into(), TensorShape::new(vec![16], Dtype::F32));
+        let scale = 0.1f32;
+        let ops = vec![
+            CompiledOp {
+                name: "q1".into(),
+                op_type: "Quantize".into(),
+                inputs: vec!["x_f32".into()],
+                outputs: vec!["x_i8".into()],
+                params: OpParams::Quantize { scale },
+            },
+            CompiledOp {
+                name: "dq1".into(),
+                op_type: "Dequantize".into(),
+                inputs: vec!["x_i8".into()],
+                outputs: vec!["y_f32".into()],
+                params: OpParams::Dequantize { scale },
+            },
+        ];
+        let graph = Graph {
+            ops,
+            shapes,
+            inputs: vec!["x_f32".into()],
+            outputs: vec!["y_f32".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::F32,
+        };
+
+        let mut rt = VulkanGraphRuntime::new(graph, backend).expect("new");
+        let input = vec![
+            0.0f32, 0.1, -0.2, 0.5, -0.5, 1.0, -1.0, 12.7, // 12.7/0.1=127, clamps OK
+            -12.7, 6.3, -6.3, 0.05, -0.05, 0.3, -0.7, 2.5,
+        ];
+        rt.set_input_f32("x_f32", &input).expect("set");
+        rt.run().expect("run");
+        let out = rt.get_output_f32("y_f32").expect("get");
+
+        // Each value should be within one quantization step (scale = 0.1)
+        // of the original. The roundtrip clamps values outside [-12.8, 12.7].
+        for (i, (a, b)) in input.iter().zip(out.iter()).enumerate() {
+            let err = (a - b).abs();
+            assert!(err <= scale, "qdq mismatch at {i}: {a} -> {b}, err={err}");
+        }
+    }
+
+    /// Build a graph that does only requantize: I32 input → I8 packed output.
+    /// Used to validate the shader directly with manually-prepared buffers.
+    fn requantize_graph() -> Graph {
+        let mut shapes = HashMap::new();
+        shapes.insert("acc_i32".into(), TensorShape::new(vec![16], Dtype::I32));
+        shapes.insert("out_i8".into(), TensorShape::new(vec![16], Dtype::I8));
+        let ops = vec![CompiledOp {
+            name: "rq1".into(),
+            op_type: "Requantize".into(),
+            inputs: vec!["acc_i32".into()],
+            outputs: vec!["out_i8".into()],
+            params: OpParams::Requantize { scale: 0.01 },
+        }];
+        Graph {
+            ops,
+            shapes,
+            inputs: vec!["acc_i32".into()],
+            outputs: vec!["out_i8".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::F32, // doesn't matter for raw byte I/O
+        }
+    }
+
+    #[test]
+    fn requantize_clamps_and_scales() {
+        let Some(backend) = try_make_backend() else {
+            eprintln!("skipping: no Vulkan device available");
+            return;
+        };
+
+        let mut rt = VulkanGraphRuntime::new(requantize_graph(), backend).expect("new");
+
+        // input INT32 values
+        let acc: Vec<i32> = vec![
+            0, 100, -100, 12700, // 12700 * 0.01 = 127
+            -12700, 25400,  // saturates to +127
+            -25400, // saturates to -128
+            500, -500, 1234, -1234, 5, -5, 9999, -9999, 12700,
+        ];
+        let acc_bytes: Vec<u8> = acc
+            .iter()
+            .flat_map(|v| v.to_le_bytes().into_iter())
+            .collect();
+        rt.set_input_bytes("acc_i32", &acc_bytes).expect("set");
+        rt.run().expect("run");
+        let out_bytes = rt.get_output_bytes("out_i8").expect("get");
+        let out: Vec<i8> = out_bytes.iter().map(|&b| b as i8).collect();
+
+        for (i, &v) in acc.iter().enumerate() {
+            let expected = ((v as f32) * 0.01).round().clamp(-128.0, 127.0) as i8;
+            assert_eq!(
+                out[i], expected,
+                "requantize[{i}]: input={v}, expected={expected}, got={}",
+                out[i]
+            );
+        }
+    }
+
+    /// INT8 ReLU graph.
+    fn relu_i8_graph() -> Graph {
+        let mut shapes = HashMap::new();
+        shapes.insert("x".into(), TensorShape::new(vec![8], Dtype::I8));
+        shapes.insert("y".into(), TensorShape::new(vec![8], Dtype::I8));
+        // OpParams::None is fine; dispatcher routes by op_type for Quantize/Relu
+        // but we use the helper directly.
+        Graph {
+            ops: Vec::new(),
+            shapes,
+            inputs: vec!["x".into()],
+            outputs: vec!["y".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::F32,
+        }
+    }
+
+    #[test]
+    fn relu_i8_clamps_negatives() {
+        let Some(backend) = try_make_backend() else {
+            eprintln!("skipping: no Vulkan device available");
+            return;
+        };
+
+        let mut rt = VulkanGraphRuntime::new(relu_i8_graph(), backend).expect("new");
+
+        let input: Vec<i8> = vec![-128, -1, 0, 1, 127, -50, 50, -10];
+        rt.set_input_bytes("x", &pack_i8_bytes(&input))
+            .expect("set");
+
+        rt.dispatch_relu_i8("x", "y").expect("relu_i8");
+        rt.backend.synchronize().expect("sync");
+
+        let out_bytes = rt.get_output_bytes("y").expect("get");
+        let out: Vec<i8> = out_bytes.iter().map(|&b| b as i8).collect();
+
+        let expected: Vec<i8> = input.iter().map(|&v| v.max(0)).collect();
+        assert_eq!(out, expected);
     }
 
     #[test]

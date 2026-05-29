@@ -81,6 +81,24 @@ pub enum OpKind {
     AddFp16,
     /// `gemm_fp16.spv` — 3 SSBOs (C output, A, B), F16 with F32 accumulator
     GemmFp16,
+
+    // -----------------------------------------------------------------------
+    // INT8 packed ops (Task 006, wired in Task 007)
+    // -----------------------------------------------------------------------
+    /// `gemm_i8_packed.spv` — 3 SSBOs (C int32 output, A packed uint32, B packed uint32)
+    GemmI8Packed,
+    /// `conv2d_i8_nhwc_packed.spv` — 3 SSBOs (output int32, input packed, kernel packed)
+    Conv2dI8NhwcPacked,
+    /// `requantize_i32_to_i8_packed.spv` — 2 SSBOs (output packed uint32, input int32)
+    RequantizeI32ToI8,
+    /// `quantize_f32_to_i8_packed.spv` — 2 SSBOs (output packed uint32, input f32)
+    QuantizeF32ToI8,
+    /// `dequantize_i8_packed_to_f32.spv` — 2 SSBOs (output f32, input packed uint32)
+    DequantizeI8ToF32,
+    /// `add_i8_packed.spv` — 3 SSBOs (output packed, A packed, B packed)
+    AddI8Packed,
+    /// `relu_i8_packed.spv` — 2 SSBOs (output packed, input packed)
+    ReluI8Packed,
 }
 
 impl OpKind {
@@ -97,6 +115,12 @@ impl OpKind {
             // YOLO ops
             OpKind::SigmoidF32 => 2,
             OpKind::MulF32 => 3,
+            // INT8 ops (Task 007)
+            OpKind::GemmI8Packed | OpKind::Conv2dI8NhwcPacked | OpKind::AddI8Packed => 3,
+            OpKind::RequantizeI32ToI8
+            | OpKind::QuantizeF32ToI8
+            | OpKind::DequantizeI8ToF32
+            | OpKind::ReluI8Packed => 2,
         }
     }
 
@@ -121,6 +145,14 @@ impl OpKind {
             // YOLO ops
             OpKind::SigmoidF32 => dragonwing_shaders::SIGMOID_F32,
             OpKind::MulF32 => dragonwing_shaders::MUL_F32,
+            // INT8 ops (Task 007)
+            OpKind::GemmI8Packed => dragonwing_shaders::GEMM_I8_PACKED,
+            OpKind::Conv2dI8NhwcPacked => dragonwing_shaders::CONV2D_I8_NHWC_PACKED,
+            OpKind::RequantizeI32ToI8 => dragonwing_shaders::REQUANTIZE_I32_TO_I8_PACKED,
+            OpKind::QuantizeF32ToI8 => dragonwing_shaders::QUANTIZE_F32_TO_I8_PACKED,
+            OpKind::DequantizeI8ToF32 => dragonwing_shaders::DEQUANTIZE_I8_PACKED_TO_F32,
+            OpKind::AddI8Packed => dragonwing_shaders::ADD_I8_PACKED,
+            OpKind::ReluI8Packed => dragonwing_shaders::RELU_I8_PACKED,
         }
     }
 
@@ -137,6 +169,21 @@ impl OpKind {
             OpKind::Conv2dF32Nhwc | OpKind::Conv2dFp16Nhwc | OpKind::Maxpool2dF32 => 64,
             // YOLO ops
             OpKind::SigmoidF32 | OpKind::MulF32 => 16,
+            // INT8 ops (Task 007)
+            //   - GEMM: { m, n, k, _ } = 16
+            //   - Conv2d: 4× uvec4 = 64
+            //   - Requantize: { n, requant_scale, _, _ } = 16
+            //   - Quantize: { n, inv_scale, _, _ } = 16
+            //   - Dequantize: { n, scale, _, _ } = 16
+            //   - Add: { n, scale_a, scale_b, _ } = 16
+            //   - ReLU: { n, _, _, _ } = 16
+            OpKind::GemmI8Packed => 16,
+            OpKind::Conv2dI8NhwcPacked => 64,
+            OpKind::RequantizeI32ToI8
+            | OpKind::QuantizeF32ToI8
+            | OpKind::DequantizeI8ToF32
+            | OpKind::AddI8Packed
+            | OpKind::ReluI8Packed => 16,
         }
     }
 }
