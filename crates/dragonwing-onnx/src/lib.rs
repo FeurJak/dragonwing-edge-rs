@@ -75,6 +75,8 @@ mod fusion;
 mod calibration;
 #[cfg(feature = "cpu")]
 mod quantize;
+#[cfg(feature = "vulkan")]
+mod vulkan_runtime;
 
 pub use error::{Error, Result};
 pub use model::{Model, OnnxNode, OnnxTensor, OnnxAttribute, AttributeValue, DataType};
@@ -95,6 +97,10 @@ pub use calibration::{Calibrator, CalibrationStrategy};
 /// Quantized graph compiler for INT8 inference (requires `cpu` feature).
 #[cfg(feature = "cpu")]
 pub use quantize::{QuantizedGraphCompiler, QuantizedGraphInfo};
+
+/// Vulkan-accelerated graph runtime (requires `vulkan` feature).
+#[cfg(feature = "vulkan")]
+pub use vulkan_runtime::VulkanGraphRuntime;
 
 use std::path::Path;
 
