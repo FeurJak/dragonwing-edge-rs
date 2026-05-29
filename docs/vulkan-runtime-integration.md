@@ -257,6 +257,35 @@ PATH=~/.cargo/bin:$PATH cargo build -p dragonwing-test \
 Initial build takes ~1m42s on the Arduino UNO Q. Subsequent
 incremental builds are seconds.
 
+## On-device validation
+
+Measured on **Arduino UNO Q** (Qualcomm QRB2210, Adreno A702 GPU,
+Turnip / Mesa 25.2.6 driver):
+
+| Test | Result |
+|------|--------|
+| 9 host/device parity tests | **9/9 pass** |
+| F32 SiLU fusion correctness | **bit-exact** (`max |unfused - fused| = 0.0`) |
+| F32 SiLU fusion speedup | **1.8–1.9×** (1 K → 256 K elements) |
+| INT8 Conv2D fusion speedup | **1.6–1.7×** (3 shapes tested) |
+| INT8 GEMM vs F32 GEMM | INT8 is ~2× *slower* in this naive shader (unpacking overhead) — fused kernels recover the gap |
+
+See `.task/implementation-task-007.md` for the full benchmark table.
+
+### Known issue fixed during validation
+
+**Descriptor pool exhaustion** (`ERROR_OUT_OF_POOL_MEMORY`) after ~64
+dispatches. Every op wrapper was allocating descriptor sets without
+ever freeing them. Fixed in commit `7bfb3bb` by:
+
+1. Making `OneShot` own the descriptor set and call
+   `free_descriptor_set` on drop (after `device_wait_idle`).
+2. Bumping the pool from 64 → 512 sets for headroom.
+
+This bug was invisible to the unit tests (each test creates a fresh
+pool with only a handful of dispatches) and only surfaced under
+benchmark load.
+
 ## Future work (Phase 6 deferred items)
 
 See `.task/implementation-task-007.md` for the full list. The
@@ -265,4 +294,7 @@ highest-priority items are:
 1. Slab-allocator wiring (`VulkanBackend::alloc → SlabAllocator`).
 2. Single command buffer per `run()` with explicit barriers.
 3. Graph-rewrite pass that emits the fused conv op-type.
-4. Workgroup-size tuning for INT8 GEMM and Conv.
+4. Bias support for Conv / Gemm (pre-fuse into weights or new shader).
+5. Pre-transpose Gemm weights at model load (current shader is
+   non-transposed-only).
+6. Workgroup-size tuning for INT8 GEMM and Conv.
