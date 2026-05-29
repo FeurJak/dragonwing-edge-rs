@@ -378,6 +378,132 @@ pub fn transpose_nhwc_to_nchw(data: &[f32], shape: &[usize; 4]) -> Vec<f32> {
     out
 }
 
+/// Pre-transpose Gemm weights so that `trans_b` becomes `false` at runtime.
+///
+/// ONNX `Gemm` ops typically have `transB=1` (weights stored as `[N, K]`,
+/// activations as `[M, K]`, output `C = A · Bᵀ`). The on-device Vulkan
+/// `gemm_f32` shader only supports the non-transposed `C = A · B` form
+/// (B stored as `[K, N]`). Rather than maintain a separate transposed
+/// shader, we transpose the weight initializer once at compile time:
+///
+/// * For each Gemm op where `trans_b == true` and `inputs[1]` is an
+///   initializer, transpose the F32/F16 weight bytes from `[N, K]` to
+///   `[K, N]`.
+/// * Update the weight tensor's shape entry accordingly.
+/// * Flip `OpParams::Gemm::trans_b` to `false` so the runtime dispatches
+///   the standard non-transposed shader.
+///
+/// `trans_a` is left untouched (rare in practice and out of scope for
+/// task 008).
+///
+/// # Errors
+///
+/// Returns an error if a Gemm op declares `trans_b=true` but its weight
+/// tensor is not an initializer (i.e. dynamic), since we can't transpose
+/// runtime tensors at compile time.
+pub fn fold_gemm_transpose(graph: &mut Graph) -> Result<()> {
+    // Collect rewrites in a first pass to avoid borrowing graph.ops mutably
+    // while inspecting initializers.
+    let mut rewrites: Vec<(usize, String, usize, usize, Dtype)> = Vec::new();
+    for (op_idx, op) in graph.ops.iter().enumerate() {
+        if op.op_type != "Gemm" {
+            continue;
+        }
+        let trans_b = match &op.params {
+            crate::builder::OpParams::Gemm { trans_b, .. } => *trans_b,
+            _ => continue,
+        };
+        if !trans_b {
+            continue;
+        }
+        if op.inputs.len() < 2 {
+            continue;
+        }
+        let weight_name = op.inputs[1].clone();
+        if !graph.initializers.contains_key(&weight_name) {
+            return Err(Error::Compile(format!(
+                "Gemm op `{}` declares trans_b=true but its weight `{weight_name}` \
+                 is not a constant initializer; runtime transposition is not \
+                 supported. Pre-transpose the weight or rewrite the model.",
+                op.name
+            )));
+        }
+        // Pre-transpose semantics: weight is currently [N, K]; rewrite to [K, N].
+        let shape = graph
+            .shapes
+            .get(&weight_name)
+            .ok_or_else(|| Error::Compile(format!("shape not found for {weight_name}")))?;
+        if shape.dims.len() != 2 {
+            return Err(Error::Compile(format!(
+                "Gemm weight {weight_name} must be 2D, got {:?}",
+                shape.dims
+            )));
+        }
+        let n_rows = shape.dims[0]; // N
+        let k_cols = shape.dims[1]; // K
+        rewrites.push((op_idx, weight_name, n_rows, k_cols, shape.dtype));
+    }
+
+    // Apply rewrites: transpose bytes, update shape, set trans_b=false.
+    for (op_idx, weight_name, n_rows, k_cols, dtype) in rewrites {
+        let data = graph
+            .initializers
+            .get_mut(&weight_name)
+            .ok_or_else(|| Error::Compile(format!("initializer {weight_name} vanished")))?;
+        match dtype {
+            Dtype::F32 => {
+                let element_size = 4;
+                if data.len() != n_rows * k_cols * element_size {
+                    return Err(Error::Compile(format!(
+                        "{weight_name}: size {} != {n_rows}*{k_cols}*4",
+                        data.len()
+                    )));
+                }
+                *data = transpose_2d_bytes(data, n_rows, k_cols, element_size);
+            }
+            Dtype::F16 => {
+                let element_size = 2;
+                if data.len() != n_rows * k_cols * element_size {
+                    return Err(Error::Compile(format!(
+                        "{weight_name}: size {} != {n_rows}*{k_cols}*2",
+                        data.len()
+                    )));
+                }
+                *data = transpose_2d_bytes(data, n_rows, k_cols, element_size);
+            }
+            other => {
+                return Err(Error::Compile(format!(
+                    "Gemm weight {weight_name} has unsupported dtype {other:?} \
+                     for compile-time transpose"
+                )));
+            }
+        }
+        // Swap shape dims: [N, K] -> [K, N].
+        if let Some(shape) = graph.shapes.get_mut(&weight_name) {
+            shape.dims = vec![k_cols, n_rows];
+        }
+        // Flip trans_b on the op.
+        if let crate::builder::OpParams::Gemm { trans_b, .. } = &mut graph.ops[op_idx].params {
+            *trans_b = false;
+        }
+    }
+    Ok(())
+}
+
+/// Transpose a 2D byte buffer where each element is `element_size` bytes,
+/// from row-major `[rows, cols]` to row-major `[cols, rows]`.
+fn transpose_2d_bytes(data: &[u8], rows: usize, cols: usize, element_size: usize) -> Vec<u8> {
+    let mut out = vec![0u8; data.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            let src = (r * cols + c) * element_size;
+            let dst = (c * rows + r) * element_size;
+            out[dst..dst + element_size].copy_from_slice(&data[src..src + element_size]);
+        }
+    }
+    out
+}
+
 /// Convert ONNX DataType to dragonwing Dtype.
 fn onnx_dtype_to_dragonwing(onnx_dtype: DataType, default: Dtype) -> Dtype {
     match onnx_dtype {
@@ -572,6 +698,168 @@ mod tests {
         let shape = TensorShape::new(vec![1, 3, 224, 224], Dtype::F32);
         assert_eq!(shape.numel(), 1 * 3 * 224 * 224);
         assert_eq!(shape.size_bytes(), 1 * 3 * 224 * 224 * 4);
+    }
+
+    #[test]
+    fn test_transpose_2d_bytes_f32() {
+        // 2 rows × 3 cols, F32 (4 bytes per element)
+        // Row-major [2,3]: [a,b,c, d,e,f] => transposed [3,2]: [a,d, b,e, c,f]
+        let a: f32 = 1.0;
+        let b: f32 = 2.0;
+        let c: f32 = 3.0;
+        let d: f32 = 4.0;
+        let e: f32 = 5.0;
+        let f: f32 = 6.0;
+        let mut input = Vec::new();
+        for v in &[a, b, c, d, e, f] {
+            input.extend_from_slice(&v.to_le_bytes());
+        }
+        let out = transpose_2d_bytes(&input, 2, 3, 4);
+        // Expected order: a, d, b, e, c, f
+        let expected = [a, d, b, e, c, f];
+        for i in 0..6 {
+            let bytes = &out[i * 4..i * 4 + 4];
+            let val = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            assert!((val - expected[i]).abs() < 1e-6, "elem {i}: {val} vs {}", expected[i]);
+        }
+    }
+
+    #[test]
+    fn test_fold_gemm_transpose_flips_flag_and_data() {
+        use crate::builder::OpParams;
+
+        // Build a minimal graph with one Gemm op (trans_b=true).
+        // A is [M=2, K=3], B is stored as [N=4, K=3] (trans_b semantics),
+        // expected post-fold: B becomes [K=3, N=4] with trans_b=false.
+        let mut shapes = HashMap::new();
+        shapes.insert("a".into(), TensorShape::new(vec![2, 3], Dtype::F32));
+        shapes.insert("b".into(), TensorShape::new(vec![4, 3], Dtype::F32));
+        shapes.insert("c".into(), TensorShape::new(vec![2, 4], Dtype::F32));
+
+        // B = row-major [4 rows, 3 cols]:
+        // row 0: 1, 2, 3
+        // row 1: 4, 5, 6
+        // row 2: 7, 8, 9
+        // row 3: 10, 11, 12
+        let b_f32: Vec<f32> = (1..=12).map(|x| x as f32).collect();
+        let b_bytes: Vec<u8> = b_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let mut initializers = HashMap::new();
+        initializers.insert("b".to_string(), b_bytes.clone());
+
+        let mut graph = Graph {
+            ops: vec![crate::builder::CompiledOp {
+                name: "gemm1".into(),
+                op_type: "Gemm".into(),
+                inputs: vec!["a".into(), "b".into()],
+                outputs: vec!["c".into()],
+                params: OpParams::Gemm {
+                    alpha: 1.0,
+                    beta: 1.0,
+                    trans_a: false,
+                    trans_b: true,
+                },
+            }],
+            shapes,
+            inputs: vec!["a".into()],
+            outputs: vec!["c".into()],
+            initializers,
+            dtype: Dtype::F32,
+        };
+
+        fold_gemm_transpose(&mut graph).expect("fold");
+
+        // trans_b should now be false.
+        match &graph.ops[0].params {
+            OpParams::Gemm { trans_b, .. } => assert!(!*trans_b, "trans_b should be false"),
+            _ => panic!("not a Gemm op"),
+        }
+        // Shape of B should now be [K, N] = [3, 4].
+        let b_shape = graph.shapes.get("b").unwrap();
+        assert_eq!(b_shape.dims, vec![3, 4]);
+        // Data should be transposed: row-major [3, 4]:
+        // row 0: 1, 4, 7, 10
+        // row 1: 2, 5, 8, 11
+        // row 2: 3, 6, 9, 12
+        let new_bytes = graph.initializers.get("b").unwrap();
+        let new_f32: Vec<f32> = new_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let expected = vec![1.0, 4.0, 7.0, 10.0, 2.0, 5.0, 8.0, 11.0, 3.0, 6.0, 9.0, 12.0];
+        for (i, (got, exp)) in new_f32.iter().zip(expected.iter()).enumerate() {
+            assert!((got - exp).abs() < 1e-6, "elem {i}: {got} vs {exp}");
+        }
+    }
+
+    #[test]
+    fn test_fold_gemm_transpose_skips_when_trans_b_false() {
+        use crate::builder::OpParams;
+
+        let mut shapes = HashMap::new();
+        shapes.insert("b".into(), TensorShape::new(vec![3, 4], Dtype::F32));
+        let mut initializers = HashMap::new();
+        let b_bytes: Vec<u8> = (1..=12)
+            .flat_map(|i: i32| (i as f32).to_le_bytes())
+            .collect();
+        initializers.insert("b".into(), b_bytes.clone());
+
+        let mut graph = Graph {
+            ops: vec![crate::builder::CompiledOp {
+                name: "gemm1".into(),
+                op_type: "Gemm".into(),
+                inputs: vec!["a".into(), "b".into()],
+                outputs: vec!["c".into()],
+                params: OpParams::Gemm {
+                    alpha: 1.0,
+                    beta: 1.0,
+                    trans_a: false,
+                    trans_b: false,
+                },
+            }],
+            shapes,
+            inputs: vec!["a".into()],
+            outputs: vec!["c".into()],
+            initializers,
+            dtype: Dtype::F32,
+        };
+
+        fold_gemm_transpose(&mut graph).expect("fold");
+
+        // Data should be unchanged.
+        assert_eq!(graph.initializers.get("b").unwrap(), &b_bytes);
+    }
+
+    #[test]
+    fn test_fold_gemm_transpose_errors_on_dynamic_weight() {
+        use crate::builder::OpParams;
+
+        let mut shapes = HashMap::new();
+        shapes.insert("b".into(), TensorShape::new(vec![4, 3], Dtype::F32));
+        // No initializer for "b" — simulates a dynamic weight.
+
+        let mut graph = Graph {
+            ops: vec![crate::builder::CompiledOp {
+                name: "gemm1".into(),
+                op_type: "Gemm".into(),
+                inputs: vec!["a".into(), "b".into()],
+                outputs: vec!["c".into()],
+                params: OpParams::Gemm {
+                    alpha: 1.0,
+                    beta: 1.0,
+                    trans_a: false,
+                    trans_b: true,
+                },
+            }],
+            shapes,
+            inputs: vec!["a".into(), "b".into()],
+            outputs: vec!["c".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::F32,
+        };
+
+        let result = fold_gemm_transpose(&mut graph);
+        assert!(result.is_err(), "expected error for dynamic gemm weight");
     }
 
     #[test]
