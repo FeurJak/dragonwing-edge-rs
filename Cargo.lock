@@ -76,6 +76,7 @@ dependencies = [
  "dragonwing-core",
  "dragonwing-cpu",
  "dragonwing-onnx",
+ "dragonwing-shaders",
  "dragonwing-vulkan",
 ]
 

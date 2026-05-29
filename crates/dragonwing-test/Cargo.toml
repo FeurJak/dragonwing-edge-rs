@@ -15,8 +15,14 @@ workspace = true
 dragonwing-core = { path = "../dragonwing-core" }
 dragonwing-cpu = { path = "../dragonwing-cpu" }
 dragonwing-vulkan = { path = "../dragonwing-vulkan" }
-dragonwing-onnx = { path = "../dragonwing-onnx" }
+dragonwing-onnx = { path = "../dragonwing-onnx", features = ["cpu", "vulkan"] }
+dragonwing-shaders = { path = "../dragonwing-shaders" }
 
 [[bin]]
 name = "parity-test"
 path = "src/bin/parity_test.rs"
+
+# Task 007 — on-device benchmark for VulkanGraphRuntime.
+[[bin]]
+name = "device-benchmark"
+path = "src/bin/device_benchmark.rs"
