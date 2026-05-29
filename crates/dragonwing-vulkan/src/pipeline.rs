@@ -351,13 +351,27 @@ impl PipelineCache {
             .map_err(|r| vk_err("create_pipeline_cache", r))?;
 
         // Create descriptor pool.
-        // Conservative sizing: 64 sets, each with up to 4 SSBOs.
+        //
+        // The pool needs enough headroom for **in-flight** descriptor sets.
+        // Each op wrapper allocates one set, runs `device_wait_idle`, then
+        // frees it in OneShot::drop (see ops.rs). Under perfectly sequential
+        // dispatch the steady-state usage is 1 set. But:
+        //
+        //  * Benchmarks loop hundreds of dispatches in a tight loop; on
+        //    busy Turnip drivers we've observed transient bursts where
+        //    several sets are in-use simultaneously (driver-internal queue).
+        //
+        //  * Graphs with N ops may queue up sets if a future change moves
+        //    to a single command buffer per run() (Phase 6 plan).
+        //
+        // 512 max_sets × ~4 SSBOs each = 2048 descriptors is well within
+        // Adreno A702 limits and gives us plenty of headroom.
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 256,
+            descriptor_count: 2048,
         }];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(64)
+            .max_sets(512)
             .pool_sizes(&pool_sizes)
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
         // SAFETY: spec-compliant struct.

@@ -38,10 +38,19 @@ use crate::VulkanBackend;
 // ---------------------------------------------------------------------------
 
 /// One-shot command pool + buffer. Freed on drop.
+///
+/// Optionally tracks a descriptor set (and the pool that owns it) so the
+/// set is returned to the pool when this `OneShot` drops — i.e. after
+/// `device_wait_idle()` confirms the GPU is no longer using it. Without
+/// this freeing, the descriptor pool is exhausted after ~64 dispatches
+/// (the pool's `max_sets` configured in `pipeline::PipelineCache::new`).
 struct OneShot {
     ctx: Arc<Context>,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
+    /// Optional descriptor set + the cache it was allocated from. Set
+    /// via `attach_descriptor_set` after recording.
+    desc: Option<(Arc<crate::pipeline::PipelineCache>, vk::DescriptorSet)>,
 }
 
 impl OneShot {
@@ -64,7 +73,21 @@ impl OneShot {
         })?;
         let cmd = cmds[0];
 
-        Ok(Self { ctx, pool, cmd })
+        Ok(Self {
+            ctx,
+            pool,
+            cmd,
+            desc: None,
+        })
+    }
+
+    /// Register a descriptor set for cleanup when this `OneShot` drops.
+    fn attach_descriptor_set(
+        &mut self,
+        cache: Arc<crate::pipeline::PipelineCache>,
+        set: vk::DescriptorSet,
+    ) {
+        self.desc = Some((cache, set));
     }
 
     fn begin(&self) -> Result<()> {
@@ -106,10 +129,16 @@ impl OneShot {
 
 impl Drop for OneShot {
     fn drop(&mut self) {
-        // Wait for GPU to finish before destroying the command pool.
-        // This ensures the command buffer is no longer in use.
+        // Wait for GPU to finish before destroying the command pool /
+        // freeing the descriptor set.
         // SAFETY: device is valid, this is a best-effort wait.
         let _ = unsafe { self.ctx.device().device_wait_idle() };
+        // Return the descriptor set to the pool *before* destroying the
+        // command pool — Vulkan does not require any particular order, but
+        // doing it first matches the allocation order.
+        if let Some((cache, set)) = self.desc.take() {
+            let _ = cache.free_descriptor_set(set);
+        }
         // SAFETY: we own pool and cmd.
         unsafe {
             // Command buffer freed implicitly when pool is destroyed.
@@ -151,7 +180,8 @@ pub fn fill_f32(backend: &VulkanBackend, dst: &mut VulkanBuffer, value: f32) -> 
     unsafe { backend.context().device().update_descriptor_sets(&write, &[]) };
 
     // Record command buffer.
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     // Push constants: must match shader's layout (16 bytes with padding).
@@ -259,7 +289,8 @@ pub fn axpy_f32(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     // Push constants: must match shader layout (16 bytes with padding).
@@ -336,7 +367,8 @@ pub fn relu_f32(backend: &VulkanBackend, x: &mut VulkanBuffer) -> Result<()> {
         .buffer_info(&buf_info)];
     unsafe { backend.context().device().update_descriptor_sets(&write, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     // Push constants: must match shader layout (16 bytes with padding).
@@ -471,7 +503,8 @@ pub fn gemm_f32(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     // Push constants: must match shader layout (16 bytes with padding).
@@ -585,7 +618,8 @@ pub fn add_f32(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -665,7 +699,8 @@ pub fn fill_fp16(backend: &VulkanBackend, dst: &mut VulkanBuffer, value: f32) ->
         .buffer_info(&buf_info)];
     unsafe { backend.context().device().update_descriptor_sets(&write, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -763,7 +798,8 @@ pub fn axpy_fp16(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -837,7 +873,8 @@ pub fn relu_fp16(backend: &VulkanBackend, x: &mut VulkanBuffer) -> Result<()> {
         .buffer_info(&buf_info)];
     unsafe { backend.context().device().update_descriptor_sets(&write, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -945,7 +982,8 @@ pub fn add_fp16(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -1077,7 +1115,8 @@ pub fn gemm_f32_tiled(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -1209,7 +1248,8 @@ pub fn gemm_fp16(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -1310,7 +1350,8 @@ pub fn conv2d_f32_nhwc(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -1387,7 +1428,8 @@ pub fn conv2d_fp16_nhwc(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -1445,7 +1487,8 @@ pub fn maxpool2d_f32(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -1495,7 +1538,8 @@ pub fn softmax_f32(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -1542,7 +1586,8 @@ pub fn sigmoid_f32(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -1588,7 +1633,8 @@ pub fn mul_f32(
     ];
     unsafe { backend.context().device().update_descriptor_sets(&writes, &[]) };
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -1710,7 +1756,8 @@ pub fn gemm_i8_packed(
         &[a_packed.vk_buffer(), b_packed.vk_buffer()],
     );
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -1818,7 +1865,8 @@ pub fn conv2d_i8_nhwc_packed(
         &[input_packed.vk_buffer(), kernel_packed.vk_buffer()],
     );
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -1888,7 +1936,8 @@ fn dispatch_simple_i8(
         .allocate_descriptor_set(cached.descriptor_set_layout)?;
     write_descriptors_n(backend, desc_set, output, inputs);
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -2069,7 +2118,8 @@ pub fn add_i8_packed(
         &[a_packed.vk_buffer(), b_packed.vk_buffer()],
     );
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -2171,7 +2221,8 @@ pub fn silu_f32(
         .allocate_descriptor_set(cached.descriptor_set_layout)?;
     write_descriptors_n(backend, desc_set, output.vk_buffer(), &[input.vk_buffer()]);
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
@@ -2291,7 +2342,8 @@ pub fn conv2d_requant_relu_i8_packed(
         &[input_packed.vk_buffer(), kernel_packed.vk_buffer()],
     );
 
-    let one_shot = OneShot::new(backend.context().clone())?;
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
     #[repr(C)]
