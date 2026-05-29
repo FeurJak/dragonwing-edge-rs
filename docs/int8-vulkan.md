@@ -335,10 +335,40 @@ INT8 Vulkan ops should match CPU within 1 quantization level:
 - Max absolute difference: 1 (due to rounding)
 - Relative error: <1% for typical workloads
 
+## Runtime Integration (Task 007)
+
+The INT8 shaders here are now wired into `VulkanGraphRuntime`. See
+`docs/vulkan-runtime-integration.md` for the full dispatch table and
+buffer-lifecycle details.
+
+OpKind variants added to `pipeline.rs`:
+- `GemmI8Packed` (16-byte push)
+- `Conv2dI8NhwcPacked` (64-byte push)
+- `RequantizeI32ToI8` (16-byte push)
+- `QuantizeF32ToI8` (16-byte push)
+- `DequantizeI8ToF32` (16-byte push)
+- `AddI8Packed` (16-byte push, two scales)
+- `ReluI8Packed` (16-byte push)
+- `Conv2dRequantReluI8Packed` (80-byte push) — fused conv kernel
+  added in task 007 Phase 4
+
+OpParams routing in `vulkan_runtime.rs`:
+- `OpParams::Quantize { scale }`     → `quantize_f32_to_i8_packed`
+- `OpParams::Dequantize { scale }`   → `dequantize_i8_packed_to_f32`
+- `OpParams::Requantize { scale }`   → `requantize_i32_to_i8_packed`
+- `OpParams::AddQuantized { sa, sb }` → `add_i8_packed`
+
+The fused conv (`Conv2dRequantReluI8Packed`) is not yet routed from
+an `OpParams` variant; it's callable from low-level code via
+`dragonwing_vulkan::ops::conv2d_requant_relu_i8_packed`. Adding a
+graph-rewrite pass that emits the fused op is on the task 007 follow-up
+list.
+
 ## Future Improvements
 
 - [ ] Tiled GEMM with shared memory caching
-- [ ] Fused conv + requantize + ReLU kernel
+- [x] Fused conv + requantize + ReLU kernel (task 007, low-level only)
+- [ ] Graph-rewrite pass to detect conv→requant→relu and emit fused op
 - [ ] Asymmetric quantization support (non-zero zero_point)
 - [ ] UINT8 support for unsigned activations
 - [ ] Batch GEMM for multiple outputs
