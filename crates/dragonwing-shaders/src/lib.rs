@@ -227,6 +227,32 @@ pub const ADD_I8_PACKED: &[u8] =
 pub const RELU_I8_PACKED: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/relu_i8_packed.spv"));
 
+// ---------------------------------------------------------------------------
+// Fused kernels (Task 007)
+// ---------------------------------------------------------------------------
+
+/// `silu_f32` — Fused SiLU activation: `y[i] = x[i] * sigmoid(x[i])`.
+///
+/// Saves one full-tensor pass vs the separate `sigmoid_f32 + mul_f32`
+/// chain. YOLOv8 uses SiLU extensively, so this fusion is the highest-ROI
+/// F32 op fusion in the codebase.
+///
+/// Push-constant layout: `{ uint n; uint _; uint _; uint _; }`.
+/// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
+pub const SILU_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_f32.spv"));
+
+/// `conv2d_requant_relu_i8_packed` — Fused INT8 Conv2D + Requantize + ReLU.
+///
+/// Dominant compute pattern in YOLO INT8 inference. Each invocation
+/// produces 4 INT8 output channels (packed UINT32). Requires `c_out` to
+/// be a multiple of 4.
+///
+/// Push-constant layout (80 bytes):
+/// `{ uvec4 dims0; uvec4 dims1; uvec4 dims2; uvec4 dims3; float requant_scale; uint do_relu; }`.
+/// Dispatch: `gx = ceil(w_out / 8), gy = ceil(h_out / 8), gz = n * c_out_packed`.
+pub const CONV2D_REQUANT_RELU_I8_PACKED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/conv2d_requant_relu_i8_packed.spv"));
+
 /// Convenience: every shader byte-slice in the crate, indexed by a
 /// stable string id. Useful for a `--list-shaders` developer tool.
 pub const ALL: &[(&str, &[u8])] = &[
@@ -255,6 +281,9 @@ pub const ALL: &[(&str, &[u8])] = &[
     ("quantize_f32_to_i8_packed", QUANTIZE_F32_TO_I8_PACKED),
     ("add_i8_packed", ADD_I8_PACKED),
     ("relu_i8_packed", RELU_I8_PACKED),
+    // Fused kernels (Task 007)
+    ("silu_f32", SILU_F32),
+    ("conv2d_requant_relu_i8_packed", CONV2D_REQUANT_RELU_I8_PACKED),
 ];
 
 #[cfg(test)]

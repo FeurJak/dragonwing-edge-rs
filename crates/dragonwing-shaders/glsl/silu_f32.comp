@@ -1,0 +1,55 @@
+#version 450
+//
+// silu_f32 — Fused SiLU activation: y[i] = x[i] * sigmoid(x[i]).
+//
+// SiLU (also known as "swish") is the activation function used throughout
+// YOLOv8. Fusing the sigmoid and multiply into a single shader saves:
+//   * one full-tensor read (sigmoid output → mul input) 
+//   * one full-tensor write (sigmoid result temporary)
+//   * one descriptor-set update + dispatch + barrier
+//
+// On Adreno A702 this matters because compute is fast and memory traffic
+// is the dominant cost for elementwise YOLO activations.
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Output[n]  (write-only, F32)
+//   set=0 binding=1  std430 buffer Input[n]   (read-only, F32)
+//
+// Push constants (16 bytes):
+//   uint n          // element count
+//   uint _pad0
+//   uint _pad1
+//   uint _pad2
+//
+// Dispatch:
+//   gx = ceil(n / 64), gy = gz = 1
+//
+// Workgroup: 64 invocations along x.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float output_data[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuf {
+    float input_data[];
+};
+
+layout(push_constant) uniform Pc {
+    uint n;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.n) {
+        return;
+    }
+    float x = input_data[idx];
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    float s = 1.0 / (1.0 + exp(-x));
+    output_data[idx] = x * s;
+}
