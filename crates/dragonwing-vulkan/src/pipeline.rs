@@ -108,6 +108,13 @@ pub enum OpKind {
     /// `conv2d_requant_relu_i8_packed.spv` — 3 SSBOs. Fused
     /// conv2d + requantize + (optional) ReLU. 80-byte push constants.
     Conv2dRequantReluI8Packed,
+
+    // -----------------------------------------------------------------------
+    // Bias / broadcast ops (Task 008)
+    // -----------------------------------------------------------------------
+    /// `bias_add_f32_nhwc.spv` — 2 SSBOs (y inout, bias readonly).
+    /// In-place broadcasting bias add over NHWC tensor.
+    BiasAddF32Nhwc,
 }
 
 impl OpKind {
@@ -133,6 +140,8 @@ impl OpKind {
             // Fused kernels (Task 007)
             OpKind::SiluF32 => 2,
             OpKind::Conv2dRequantReluI8Packed => 3,
+            // Bias add (Task 008): y (inout) + bias (read-only) = 2.
+            OpKind::BiasAddF32Nhwc => 2,
         }
     }
 
@@ -170,6 +179,8 @@ impl OpKind {
             OpKind::Conv2dRequantReluI8Packed => {
                 dragonwing_shaders::CONV2D_REQUANT_RELU_I8_PACKED
             }
+            // Bias add (Task 008)
+            OpKind::BiasAddF32Nhwc => dragonwing_shaders::BIAS_ADD_F32_NHWC,
         }
     }
 
@@ -208,6 +219,8 @@ impl OpKind {
             // The fused conv shader declares all fields contiguously in one
             // block; on most drivers 80 B is the smallest size that holds it.
             OpKind::Conv2dRequantReluI8Packed => 80,
+            // Bias add (Task 008): { n, c_out, _, _ } = 16 B.
+            OpKind::BiasAddF32Nhwc => 16,
         }
     }
 }

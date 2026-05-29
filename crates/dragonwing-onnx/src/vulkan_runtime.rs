@@ -637,15 +637,15 @@ impl VulkanGraphRuntime {
         dragonwing_vulkan::ops::gemm_f32(&self.backend, a, b, c, m, n, k)
             .map_err(|e| Error::Runtime(format!("vk gemm_f32: {e}")))?;
 
-        // Bias handling (op.inputs[2]) — Phase 2: error if present, since
-        // gemm_f32 has no bias variant. Phase 6 can add a fused gemm+bias
-        // shader or insert an Add pass.
+        // Bias handling (op.inputs[2]) — Task 008 Phase 2: insert a
+        // broadcasting bias-add pass after the gemm. bias has shape [N];
+        // C has shape [M, N]; we broadcast bias over rows by using c_out=N.
         if op.inputs.len() > 2 && !op.inputs[2].is_empty() {
-            return Err(Error::Runtime(
-                "vk gemm: bias not supported in Phase 2; preprocess model \
-                 or use CpuGraphRuntime"
-                    .into(),
-            ));
+            let bias_name = op.inputs[2].clone();
+            let (bias, c) =
+                Self::get_two_buffers(&mut self.buffers, &bias_name, &c_name_str)?;
+            dragonwing_vulkan::ops::bias_add_f32_nhwc(&self.backend, c, bias, n)
+                .map_err(|e| Error::Runtime(format!("vk gemm bias_add: {e}")))?;
         }
         Ok(())
     }
@@ -697,11 +697,12 @@ impl VulkanGraphRuntime {
                 "vk conv2d: group={group} not supported (need depthwise shader)"
             )));
         }
-        if op.inputs.len() > 2 && !op.inputs[2].is_empty() {
-            return Err(Error::Runtime(
-                "vk conv2d: bias not yet supported in Phase 2".into(),
-            ));
-        }
+
+        let bias_name: Option<String> = if op.inputs.len() > 2 && !op.inputs[2].is_empty() {
+            Some(op.inputs[2].clone())
+        } else {
+            None
+        };
 
         let in_name = in_name.clone();
         let w_name = w_name.clone();
@@ -725,7 +726,19 @@ impl VulkanGraphRuntime {
             pad_h,
             pad_w,
         )
-        .map_err(|e| Error::Runtime(format!("vk conv2d_f32_nhwc: {e}")))
+        .map_err(|e| Error::Runtime(format!("vk conv2d_f32_nhwc: {e}")))?;
+
+        // Bias handling (op.inputs[2]) — Task 008 Phase 2: broadcasting
+        // bias-add pass after the conv. Bias shape is [C_out]; output shape
+        // is [N, H_out, W_out, C_out]. The bias_add_f32_nhwc shader uses
+        // i % c_out as the bias index, which is correct for NHWC layout.
+        if let Some(bias_name) = bias_name {
+            let (bias, output) =
+                Self::get_two_buffers(&mut self.buffers, &bias_name, &out_name)?;
+            dragonwing_vulkan::ops::bias_add_f32_nhwc(&self.backend, output, bias, c_out)
+                .map_err(|e| Error::Runtime(format!("vk conv2d bias_add: {e}")))?;
+        }
+        Ok(())
     }
 
     fn dispatch_maxpool(
@@ -1528,6 +1541,168 @@ mod tests {
         let expected = [4.0f32, 5.0, 10.0, 11.0];
         for (i, (exp, got)) in expected.iter().zip(c.iter()).enumerate() {
             assert!((exp - got).abs() < 1e-4, "gemm[{i}]: {exp} vs {got}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 008 Phase 2 tests: F32 bias broadcasting for Conv/Gemm.
+    // -----------------------------------------------------------------------
+
+    /// Build a graph: c = a × b + bias, with M=2, K=3, N=4 and bias of shape [4].
+    fn gemm_with_bias_graph() -> Graph {
+        let mut shapes = HashMap::new();
+        shapes.insert("a".into(), TensorShape::new(vec![2, 3], Dtype::F32));
+        shapes.insert("b".into(), TensorShape::new(vec![3, 4], Dtype::F32));
+        shapes.insert("bias".into(), TensorShape::new(vec![4], Dtype::F32));
+        shapes.insert("c".into(), TensorShape::new(vec![2, 4], Dtype::F32));
+        let ops = vec![CompiledOp {
+            name: "gemm_bias".into(),
+            op_type: "Gemm".into(),
+            inputs: vec!["a".into(), "b".into(), "bias".into()],
+            outputs: vec!["c".into()],
+            params: OpParams::Gemm {
+                alpha: 1.0,
+                beta: 1.0,
+                trans_a: false,
+                trans_b: false,
+            },
+        }];
+        Graph {
+            ops,
+            shapes,
+            inputs: vec!["a".into(), "b".into(), "bias".into()],
+            outputs: vec!["c".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::F32,
+        }
+    }
+
+    #[test]
+    fn gemm_with_bias_matches_reference() {
+        let Some(backend) = try_make_backend() else {
+            eprintln!("skipping: no Vulkan device available");
+            return;
+        };
+        let mut rt = VulkanGraphRuntime::new(gemm_with_bias_graph(), backend).expect("new");
+
+        // a is 2×3
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        // b is 3×4, identity-ish so the matmul produces a recognisable result
+        // Use a structured pattern: b[k,n] = (k+1) * (n+1)
+        let b: Vec<f32> = {
+            let mut v = vec![0.0; 12];
+            for k in 0..3 {
+                for n in 0..4 {
+                    v[k * 4 + n] = (k as f32 + 1.0) * (n as f32 + 1.0);
+                }
+            }
+            v
+        };
+        let bias: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0];
+
+        rt.set_input_f32("a", &a).expect("set a");
+        rt.set_input_f32("b", &b).expect("set b");
+        rt.set_input_f32("bias", &bias).expect("set bias");
+        rt.run().expect("run");
+        let c = rt.get_output_f32("c").expect("get c");
+
+        // Reference CPU compute: c[m,n] = sum_k a[m,k]*b[k,n] + bias[n]
+        for m in 0..2 {
+            for n in 0..4 {
+                let mut acc = 0.0f32;
+                for k in 0..3 {
+                    acc += a[m * 3 + k] * b[k * 4 + n];
+                }
+                let exp = acc + bias[n];
+                let got = c[m * 4 + n];
+                assert!(
+                    (exp - got).abs() < 1e-4,
+                    "gemm_bias[{m},{n}]: exp={exp} got={got}"
+                );
+            }
+        }
+    }
+
+    /// Build a conv graph with bias: 1×3×3×4 input, 1×1 kernel, 4→2 channels, bias[2].
+    fn conv_with_bias_graph() -> Graph {
+        let mut shapes = HashMap::new();
+        shapes.insert("x".into(), TensorShape::new(vec![1, 3, 3, 4], Dtype::F32));
+        // Kernel for conv2d_f32_nhwc: layout [k_h, k_w, c_in, c_out]
+        shapes.insert("w".into(), TensorShape::new(vec![1, 1, 4, 2], Dtype::F32));
+        shapes.insert("bias".into(), TensorShape::new(vec![2], Dtype::F32));
+        shapes.insert("y".into(), TensorShape::new(vec![1, 3, 3, 2], Dtype::F32));
+        let ops = vec![CompiledOp {
+            name: "conv_bias".into(),
+            op_type: "Conv".into(),
+            inputs: vec!["x".into(), "w".into(), "bias".into()],
+            outputs: vec!["y".into()],
+            params: OpParams::Conv2d {
+                kernel_shape: [1, 1],
+                strides: [1, 1],
+                pads: [0, 0, 0, 0],
+                dilations: [1, 1],
+                group: 1,
+            },
+        }];
+        Graph {
+            ops,
+            shapes,
+            inputs: vec!["x".into(), "w".into(), "bias".into()],
+            outputs: vec!["y".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::F32,
+        }
+    }
+
+    #[test]
+    fn conv2d_with_bias_matches_reference() {
+        let Some(backend) = try_make_backend() else {
+            eprintln!("skipping: no Vulkan device available");
+            return;
+        };
+        let mut rt =
+            VulkanGraphRuntime::new(conv_with_bias_graph(), backend).expect("new");
+
+        // Input: 1×3×3×4 = 36 elements, deterministic pattern.
+        let mut x = vec![0.0f32; 36];
+        for i in 0..36 {
+            x[i] = (i as f32) * 0.1 - 1.0;
+        }
+        // Kernel: 1×1×4×2 = 8 elements. Pattern: w[k_h, k_w, c_in, c_out].
+        // For a 1×1 conv, this reduces to a [4×2] matmul per spatial.
+        let w: Vec<f32> = vec![
+            // c_in=0: c_out 0, 1
+            0.5, -0.25,
+            // c_in=1
+            0.1, 0.2,
+            // c_in=2
+            -0.3, 0.4,
+            // c_in=3
+            0.7, 0.0,
+        ];
+        let bias: Vec<f32> = vec![100.0, -50.0];
+
+        rt.set_input_f32("x", &x).expect("set x");
+        rt.set_input_f32("w", &w).expect("set w");
+        rt.set_input_f32("bias", &bias).expect("set bias");
+        rt.run().expect("run");
+        let y = rt.get_output_f32("y").expect("get y");
+
+        // Reference: for each spatial position s in 0..9, for each oc in 0..2,
+        //   y[s, oc] = sum_{ic=0..4} x[s, ic] * w[ic, oc] + bias[oc]
+        for s in 0..9 {
+            for oc in 0..2 {
+                let mut acc = 0.0f32;
+                for ic in 0..4 {
+                    acc += x[s * 4 + ic] * w[ic * 2 + oc];
+                }
+                let exp = acc + bias[oc];
+                let got = y[s * 2 + oc];
+                assert!(
+                    (exp - got).abs() < 1e-4,
+                    "conv_bias[s={s},oc={oc}]: exp={exp} got={got}"
+                );
+            }
         }
     }
 }

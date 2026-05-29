@@ -135,6 +135,20 @@ pub const SIGMOID_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid
 pub const MUL_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_f32.spv"));
 
 // ===========================================================================
+// Bias add (Task 008) — broadcasts a 1D bias over an NHWC tensor in-place.
+// Used to add ONNX Conv/Gemm bias after the F32 conv/gemm shader, which
+// itself has no bias input.
+// ===========================================================================
+
+/// `bias_add_f32_nhwc` — In-place broadcasting bias add over NHWC tensor.
+///
+/// `y[i] += bias[i % c_out]` for `i in 0..n`.
+/// Push-constant layout: `{ uint n; uint c_out; uint _; uint _; }`.
+/// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
+pub const BIAS_ADD_F32_NHWC: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/bias_add_f32_nhwc.spv"));
+
+// ===========================================================================
 // FP16 shaders (require VK_KHR_16bit_storage + shaderFloat16)
 // ===========================================================================
 
@@ -268,6 +282,7 @@ pub const ALL: &[(&str, &[u8])] = &[
     ("softmax_f32", SOFTMAX_F32),
     ("sigmoid_f32", SIGMOID_F32),
     ("mul_f32", MUL_F32),
+    ("bias_add_f32_nhwc", BIAS_ADD_F32_NHWC),
     ("fill_fp16", FILL_FP16),
     ("axpy_fp16", AXPY_FP16),
     ("relu_fp16", RELU_FP16),

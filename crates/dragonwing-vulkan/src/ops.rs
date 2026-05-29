@@ -2400,3 +2400,98 @@ pub fn conv2d_requant_relu_i8_packed(
     one_shot.end()?;
     one_shot.submit()
 }
+
+/// In-place broadcasting bias add over an NHWC tensor.
+///
+/// Computes `y[i] += bias[i % c_out]` for `i in 0..n_elem`, where `n_elem`
+/// is the full element count of `y` (typically `N * H * W * C`) and
+/// `c_out` is the per-pixel channel count.
+///
+/// Used to add ONNX Conv/Gemm biases after the corresponding F32 op
+/// (which has no bias input on its shader binding). For Gemm with output
+/// shape `[M, N]`, pass `c_out = N` and `n_elem = M * N`.
+///
+/// Buffer sizes:
+///   - `y_inout`: `n_elem * 4` bytes (F32).
+///   - `bias`:    `c_out * 4` bytes (F32).
+pub fn bias_add_f32_nhwc(
+    backend: &VulkanBackend,
+    y_inout: &mut VulkanBuffer,
+    bias: &VulkanBuffer,
+    c_out: usize,
+) -> Result<()> {
+    if !y_inout.len_bytes().is_multiple_of(4) {
+        return Err(Error::Backend(
+            "bias_add_f32_nhwc: y size must be multiple of 4".into(),
+        ));
+    }
+    if !bias.len_bytes().is_multiple_of(4) {
+        return Err(Error::Backend(
+            "bias_add_f32_nhwc: bias size must be multiple of 4".into(),
+        ));
+    }
+    let n = y_inout.len_bytes() / 4;
+    let bias_n = bias.len_bytes() / 4;
+    if bias_n != c_out {
+        return Err(Error::Backend(format!(
+            "bias_add_f32_nhwc: bias has {bias_n} elements, expected {c_out}"
+        )));
+    }
+    if c_out == 0 || n == 0 {
+        return Ok(());
+    }
+    if n % c_out != 0 {
+        return Err(Error::Backend(format!(
+            "bias_add_f32_nhwc: total elements {n} not divisible by c_out {c_out}"
+        )));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::BiasAddF32Nhwc)?;
+    let desc_set = backend
+        .pipelines()
+        .allocate_descriptor_set(cached.descriptor_set_layout)?;
+    write_descriptors_n(backend, desc_set, y_inout.vk_buffer(), &[bias.vk_buffer()]);
+
+    let mut one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushBiasAdd {
+        n: u32,
+        c_out: u32,
+        _p0: u32,
+        _p1: u32,
+    }
+    let pc = PushBiasAdd {
+        n: n as u32,
+        c_out: c_out as u32,
+        _p0: 0,
+        _p1: 0,
+    };
+    let pc_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), 16) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(
+            one_shot.cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            cached.layout,
+            0,
+            &[desc_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            one_shot.cmd,
+            cached.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            pc_bytes,
+        );
+        device.cmd_dispatch(one_shot.cmd, (n as u32).div_ceil(64), 1, 1);
+    }
+    one_shot.end()?;
+    one_shot.submit()
+}
