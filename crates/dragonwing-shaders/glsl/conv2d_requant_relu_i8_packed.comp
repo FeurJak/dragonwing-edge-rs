@@ -1,0 +1,178 @@
+#version 450
+//
+// conv2d_requant_relu_i8_packed — Fused INT8 Conv2D + Requantize + ReLU.
+//
+// The dominant compute pattern in YOLO INT8 inference:
+//
+//     int32_acc = conv2d_i8(input, kernel)            // O(K_h*K_w*C_in) MACs
+//     int8_out  = clamp(round(acc * scale), -128, 127) // requantize
+//     int8_out  = max(int8_out, 0)                     // ReLU (zero-point 0)
+//
+// Fusing avoids:
+//   * one INT32 write (acc) of size H_out * W_out * C_out * 4 bytes
+//   * one INT32 read by requantize of the same size
+//   * one descriptor / dispatch / pipeline-barrier per layer
+//
+// Output is packed UINT32 (4× INT8 per word, along C_out). This requires
+// `C_out` to be a multiple of 4; each invocation computes 4 consecutive
+// output channels and packs them into one UINT32.
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Output_packed[N*H_out*W_out*C_out/4]  (write, UINT32)
+//   set=0 binding=1  std430 buffer Input_packed[N*H*W*C_in/4]            (read, UINT32)
+//   set=0 binding=2  std430 buffer Kernel_packed[K_h*K_w*C_out*C_in/4]   (read, UINT32)
+//
+// Push constants (64 bytes):
+//   uvec4 dims0: { h_in, w_in, c_in, c_out }
+//   uvec4 dims1: { k_h, k_w, stride_h, stride_w }
+//   uvec4 dims2: { pad_h, pad_w, h_out, w_out }
+//   uvec4 dims3: { n, c_in_packed, c_out_packed, _ }  // both = ../4
+//   float requant_scale       ← appended after the uvec4s (76 bytes total).
+//   uint do_relu              ← appended after the float (80 bytes).
+//
+// Note: GLSL std140/std430 places `float` and `uint` in 4-byte slots; the
+// trailing fields fit cleanly after the 4× uvec4. Total push = 80 bytes.
+//
+// Dispatch:
+//   gx = ceil(w_out / 8), gy = ceil(h_out / 8), gz = n * c_out_packed
+//
+// Workgroup: 8x8x1 = 64 invocations.
+//
+// Performance note: the kernel-layout assumption is identical to
+// `conv2d_i8_nhwc_packed`: kernel_packed[kh][kw][oc][ic_pack] with oc as
+// outer-to-ic_pack. So we read 4 separate kernel words (one per oc) per
+// (kh, kw, ic_pack).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    uint output_packed[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuf {
+    uint input_packed[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer KernelBuf {
+    uint kernel_packed[];
+};
+
+layout(push_constant) uniform Pc {
+    uvec4 dims0;            // h_in, w_in, c_in, c_out
+    uvec4 dims1;            // k_h, k_w, stride_h, stride_w
+    uvec4 dims2;            // pad_h, pad_w, h_out, w_out
+    uvec4 dims3;            // n, c_in_packed, c_out_packed, _
+    float requant_scale;
+    uint do_relu;
+} pc;
+
+ivec4 unpack_i8x4(uint packed) {
+    int i0 = int(packed & 0xFFu);
+    int i1 = int((packed >> 8u) & 0xFFu);
+    int i2 = int((packed >> 16u) & 0xFFu);
+    int i3 = int((packed >> 24u) & 0xFFu);
+    if (i0 >= 128) i0 -= 256;
+    if (i1 >= 128) i1 -= 256;
+    if (i2 >= 128) i2 -= 256;
+    if (i3 >= 128) i3 -= 256;
+    return ivec4(i0, i1, i2, i3);
+}
+
+uint pack_i8x4(ivec4 vals) {
+    uint b0 = uint(clamp(vals.x, -128, 127)) & 0xFFu;
+    uint b1 = uint(clamp(vals.y, -128, 127)) & 0xFFu;
+    uint b2 = uint(clamp(vals.z, -128, 127)) & 0xFFu;
+    uint b3 = uint(clamp(vals.w, -128, 127)) & 0xFFu;
+    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+}
+
+int requant_one(int acc, float scale, uint do_relu_u) {
+    int r = int(round(float(acc) * scale));
+    if (do_relu_u != 0u) {
+        r = max(r, 0);
+    }
+    return clamp(r, -128, 127);
+}
+
+void main() {
+    uint h_in = pc.dims0.x;
+    uint w_in = pc.dims0.y;
+    uint c_in = pc.dims0.z;
+    uint c_out = pc.dims0.w;
+
+    uint k_h = pc.dims1.x;
+    uint k_w = pc.dims1.y;
+    uint stride_h = pc.dims1.z;
+    uint stride_w = pc.dims1.w;
+
+    uint pad_h = pc.dims2.x;
+    uint pad_w = pc.dims2.y;
+    uint h_out = pc.dims2.z;
+    uint w_out = pc.dims2.w;
+
+    uint n = pc.dims3.x;
+    uint c_in_packed = pc.dims3.y;
+    uint c_out_packed = pc.dims3.z;
+
+    uint ow = gl_GlobalInvocationID.x;
+    uint oh = gl_GlobalInvocationID.y;
+    uint batch_ocp = gl_GlobalInvocationID.z;
+    uint batch = batch_ocp / c_out_packed;
+    uint oc_pack = batch_ocp % c_out_packed;
+
+    if (ow >= w_out || oh >= h_out || batch >= n) {
+        return;
+    }
+
+    // 4 consecutive oc values produced by this invocation
+    uint oc_base = oc_pack * 4u;
+
+    int acc0 = 0;
+    int acc1 = 0;
+    int acc2 = 0;
+    int acc3 = 0;
+
+    for (uint kh = 0u; kh < k_h; kh++) {
+        for (uint kw = 0u; kw < k_w; kw++) {
+            int ih = int(oh * stride_h + kh) - int(pad_h);
+            int iw = int(ow * stride_w + kw) - int(pad_w);
+            if (ih < 0 || ih >= int(h_in) || iw < 0 || iw >= int(w_in)) {
+                continue;
+            }
+            for (uint ic_pack = 0u; ic_pack < c_in_packed; ic_pack++) {
+                uint input_idx = ((batch * h_in + uint(ih)) * w_in + uint(iw))
+                                 * c_in_packed + ic_pack;
+                ivec4 in_vals = unpack_i8x4(input_packed[input_idx]);
+
+                // 4 separate kernel words for the 4 oc values
+                uint k_base = (kh * k_w + kw) * c_out * c_in_packed
+                              + oc_base * c_in_packed
+                              + ic_pack;
+                ivec4 k0 = unpack_i8x4(kernel_packed[k_base + 0u * c_in_packed]);
+                ivec4 k1 = unpack_i8x4(kernel_packed[k_base + 1u * c_in_packed]);
+                ivec4 k2 = unpack_i8x4(kernel_packed[k_base + 2u * c_in_packed]);
+                ivec4 k3 = unpack_i8x4(kernel_packed[k_base + 3u * c_in_packed]);
+
+                acc0 += in_vals.x * k0.x + in_vals.y * k0.y
+                      + in_vals.z * k0.z + in_vals.w * k0.w;
+                acc1 += in_vals.x * k1.x + in_vals.y * k1.y
+                      + in_vals.z * k1.z + in_vals.w * k1.w;
+                acc2 += in_vals.x * k2.x + in_vals.y * k2.y
+                      + in_vals.z * k2.z + in_vals.w * k2.w;
+                acc3 += in_vals.x * k3.x + in_vals.y * k3.y
+                      + in_vals.z * k3.z + in_vals.w * k3.w;
+            }
+        }
+    }
+
+    // Apply requantize + optional ReLU + pack
+    ivec4 result = ivec4(
+        requant_one(acc0, pc.requant_scale, pc.do_relu),
+        requant_one(acc1, pc.requant_scale, pc.do_relu),
+        requant_one(acc2, pc.requant_scale, pc.do_relu),
+        requant_one(acc3, pc.requant_scale, pc.do_relu)
+    );
+
+    uint output_idx = ((batch * h_out + oh) * w_out + ow) * c_out_packed + oc_pack;
+    output_packed[output_idx] = pack_i8x4(result);
+}

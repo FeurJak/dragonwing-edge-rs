@@ -2138,3 +2138,213 @@ pub fn relu_i8_packed(
         256,
     )
 }
+
+// ===========================================================================
+// Fused kernels (Task 007)
+// ===========================================================================
+
+/// Fused SiLU activation: `y[i] = x[i] * sigmoid(x[i])`.
+///
+/// Replaces the `sigmoid_f32 + mul_f32` pair with a single shader. Saves
+/// one full-tensor memory pass — the dominant cost for elementwise YOLO
+/// activations on Adreno A702.
+///
+/// Buffers must be the same size, a multiple of 4 bytes (F32 elements).
+pub fn silu_f32(
+    backend: &VulkanBackend,
+    input: &VulkanBuffer,
+    output: &mut VulkanBuffer,
+) -> Result<()> {
+    let n = input.len_bytes() / 4;
+    if input.len_bytes() != output.len_bytes() {
+        return Err(Error::Backend("silu_f32: buffer size mismatch".into()));
+    }
+    if !input.len_bytes().is_multiple_of(4) {
+        return Err(Error::Backend(
+            "silu_f32: buffer size must be multiple of 4".into(),
+        ));
+    }
+
+    let cached = backend.pipelines().get_or_create(OpKind::SiluF32)?;
+    let desc_set = backend
+        .pipelines()
+        .allocate_descriptor_set(cached.descriptor_set_layout)?;
+    write_descriptors_n(backend, desc_set, output.vk_buffer(), &[input.vk_buffer()]);
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushSilu {
+        n: u32,
+        _p0: u32,
+        _p1: u32,
+        _p2: u32,
+    }
+    let pc = PushSilu {
+        n: n as u32,
+        _p0: 0,
+        _p1: 0,
+        _p2: 0,
+    };
+    let pc_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), 16) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(
+            one_shot.cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            cached.layout,
+            0,
+            &[desc_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            one_shot.cmd,
+            cached.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            pc_bytes,
+        );
+        device.cmd_dispatch(one_shot.cmd, (n as u32).div_ceil(64), 1, 1);
+    }
+    one_shot.end()?;
+    one_shot.submit()
+}
+
+/// Fused INT8 Conv2D + Requantize + ReLU (NHWC, channel-packed).
+///
+/// One shader produces packed-I8 output directly from packed-I8 inputs and
+/// weights. Each invocation produces 4 output channels (packed into a
+/// UINT32), so `c_out` must be a multiple of 4. `c_in` must also be a
+/// multiple of 4 (input packing).
+///
+/// `do_relu`: if `true`, applies ReLU (clip to ≥ 0) after requantize.
+/// Useful when followed by a layer that expects unsigned-only activations;
+/// `false` keeps the full INT8 range.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_requant_relu_i8_packed(
+    backend: &VulkanBackend,
+    input_packed: &VulkanBuffer,
+    kernel_packed: &VulkanBuffer,
+    output_packed: &mut VulkanBuffer,
+    n: usize,
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    c_out: usize,
+    k_h: usize,
+    k_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+    requant_scale: f32,
+    do_relu: bool,
+) -> Result<()> {
+    if !c_in.is_multiple_of(4) {
+        return Err(Error::Backend(format!(
+            "conv_fused: c_in={c_in} must be multiple of 4"
+        )));
+    }
+    if !c_out.is_multiple_of(4) {
+        return Err(Error::Backend(format!(
+            "conv_fused: c_out={c_out} must be multiple of 4 (output is packed)"
+        )));
+    }
+    let h_out = (h_in + 2 * pad_h - k_h) / stride_h + 1;
+    let w_out = (w_in + 2 * pad_w - k_w) / stride_w + 1;
+    let expected_input = n * h_in * w_in * c_in;
+    let expected_kernel = k_h * k_w * c_in * c_out;
+    let expected_output = n * h_out * w_out * c_out; // packed: 1 byte per element
+    if input_packed.len_bytes() != expected_input {
+        return Err(Error::Backend(format!(
+            "conv_fused: input mismatch: expected {expected_input}, got {}",
+            input_packed.len_bytes()
+        )));
+    }
+    if kernel_packed.len_bytes() != expected_kernel {
+        return Err(Error::Backend(format!(
+            "conv_fused: kernel mismatch: expected {expected_kernel}, got {}",
+            kernel_packed.len_bytes()
+        )));
+    }
+    if output_packed.len_bytes() != expected_output {
+        return Err(Error::Backend(format!(
+            "conv_fused: output mismatch: expected {expected_output}, got {}",
+            output_packed.len_bytes()
+        )));
+    }
+
+    let cached = backend
+        .pipelines()
+        .get_or_create(OpKind::Conv2dRequantReluI8Packed)?;
+    let desc_set = backend
+        .pipelines()
+        .allocate_descriptor_set(cached.descriptor_set_layout)?;
+    write_descriptors_n(
+        backend,
+        desc_set,
+        output_packed.vk_buffer(),
+        &[input_packed.vk_buffer(), kernel_packed.vk_buffer()],
+    );
+
+    let one_shot = OneShot::new(backend.context().clone())?;
+    one_shot.begin()?;
+
+    #[repr(C)]
+    struct PushConvFused {
+        dims0: [u32; 4],
+        dims1: [u32; 4],
+        dims2: [u32; 4],
+        dims3: [u32; 4],
+        requant_scale: f32,
+        do_relu: u32,
+        _pad0: u32,
+        _pad1: u32,
+    }
+    // Size = 64 + 16 = 80 bytes. Matches OpKind::Conv2dRequantReluI8Packed
+    // push_constant_size() above.
+    let pc = PushConvFused {
+        dims0: [h_in as u32, w_in as u32, c_in as u32, c_out as u32],
+        dims1: [k_h as u32, k_w as u32, stride_h as u32, stride_w as u32],
+        dims2: [pad_h as u32, pad_w as u32, h_out as u32, w_out as u32],
+        dims3: [n as u32, (c_in / 4) as u32, (c_out / 4) as u32, 0],
+        requant_scale,
+        do_relu: if do_relu { 1 } else { 0 },
+        _pad0: 0,
+        _pad1: 0,
+    };
+    let pc_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), 80) };
+
+    let device = backend.context().device();
+    unsafe {
+        device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
+        device.cmd_bind_descriptor_sets(
+            one_shot.cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            cached.layout,
+            0,
+            &[desc_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            one_shot.cmd,
+            cached.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            pc_bytes,
+        );
+        device.cmd_dispatch(
+            one_shot.cmd,
+            (w_out as u32).div_ceil(8),
+            (h_out as u32).div_ceil(8),
+            (n * (c_out / 4)) as u32,
+        );
+    }
+    one_shot.end()?;
+    one_shot.submit()
+}

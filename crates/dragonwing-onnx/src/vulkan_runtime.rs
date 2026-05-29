@@ -352,6 +352,9 @@ impl VulkanGraphRuntime {
                 // Phase 2 will route to relu_f32.
                 "Flatten" | "Reshape" => self.dispatch_reshape(op),
                 "Relu" => self.dispatch_relu(op),
+                // Fused SiLU op produced by the task 005 fusion pass.
+                // Runs as a single shader instead of separate sigmoid + mul.
+                "SiLU" => self.dispatch_silu(op),
                 _ => Ok(()),
             },
             OpParams::Reshape { .. } => self.dispatch_reshape(op),
@@ -528,6 +531,26 @@ impl VulkanGraphRuntime {
         let (input, output) = Self::get_two_buffers(&mut self.buffers, &op.inputs[0], &op.outputs[0])?;
         dragonwing_vulkan::ops::sigmoid_f32(&self.backend, input, output)
             .map_err(|e| Error::Runtime(format!("vk sigmoid_f32: {e}")))
+    }
+
+    /// Fused SiLU (`x * sigmoid(x)`) dispatcher — one shader replaces two.
+    ///
+    /// The op_type is the string "SiLU" produced by the fusion pass in
+    /// `crates/dragonwing-onnx/src/fusion.rs`. The op has a single input
+    /// (x) and a single output (z = x * σ(x)).
+    fn dispatch_silu(&mut self, op: &CompiledOp) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("silu: missing input/output".into()));
+        }
+        if op.inputs[0] == op.outputs[0] {
+            return Err(Error::Runtime(
+                "vk silu_f32 does not support in-place".into(),
+            ));
+        }
+        let (input, output) =
+            Self::get_two_buffers(&mut self.buffers, &op.inputs[0], &op.outputs[0])?;
+        dragonwing_vulkan::ops::silu_f32(&self.backend, input, output)
+            .map_err(|e| Error::Runtime(format!("vk silu_f32: {e}")))
     }
 
     fn dispatch_clip(&mut self, op: &CompiledOp, min: f32, max: f32) -> Result<()> {
@@ -1068,6 +1091,53 @@ mod tests {
             outputs: vec!["z".into()],
             initializers: HashMap::new(),
             dtype: Dtype::F32,
+        }
+    }
+
+    /// Fused SiLU graph: same input/output as `silu_graph`, but the
+    /// fusion pass has collapsed sigmoid + mul into a single SiLU op.
+    fn fused_silu_graph() -> Graph {
+        let mut shapes = HashMap::new();
+        shapes.insert("x".into(), TensorShape::new(vec![8], Dtype::F32));
+        shapes.insert("z".into(), TensorShape::new(vec![8], Dtype::F32));
+        let ops = vec![CompiledOp {
+            name: "silu1".into(),
+            op_type: "SiLU".into(),
+            inputs: vec!["x".into()],
+            outputs: vec!["z".into()],
+            params: OpParams::None,
+        }];
+        Graph {
+            ops,
+            shapes,
+            inputs: vec!["x".into()],
+            outputs: vec!["z".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::F32,
+        }
+    }
+
+    #[test]
+    fn fused_silu_matches_reference() {
+        let Some(backend) = try_make_backend() else {
+            eprintln!("skipping: no Vulkan device available");
+            return;
+        };
+        let mut rt = VulkanGraphRuntime::new(fused_silu_graph(), backend).expect("new");
+
+        let x = vec![-3.0f32, -1.0, 0.0, 0.5, 1.0, 2.0, -0.5, 1.5];
+        rt.set_input_f32("x", &x).expect("set");
+        rt.run().expect("run");
+        let z = rt.get_output_f32("z").expect("get");
+
+        for (i, &xi) in x.iter().enumerate() {
+            let sig = 1.0 / (1.0 + (-xi).exp());
+            let expected = xi * sig;
+            assert!(
+                (expected - z[i]).abs() < 1e-4,
+                "fused silu mismatch at {i}: {expected} vs {}",
+                z[i]
+            );
         }
     }
 

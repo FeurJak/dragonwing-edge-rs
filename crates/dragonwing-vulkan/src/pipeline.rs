@@ -99,6 +99,15 @@ pub enum OpKind {
     AddI8Packed,
     /// `relu_i8_packed.spv` — 2 SSBOs (output packed, input packed)
     ReluI8Packed,
+
+    // -----------------------------------------------------------------------
+    // Fused kernels (Task 007)
+    // -----------------------------------------------------------------------
+    /// `silu_f32.spv` — 2 SSBOs (output, input). Fused sigmoid+mul.
+    SiluF32,
+    /// `conv2d_requant_relu_i8_packed.spv` — 3 SSBOs. Fused
+    /// conv2d + requantize + (optional) ReLU. 80-byte push constants.
+    Conv2dRequantReluI8Packed,
 }
 
 impl OpKind {
@@ -121,6 +130,9 @@ impl OpKind {
             | OpKind::QuantizeF32ToI8
             | OpKind::DequantizeI8ToF32
             | OpKind::ReluI8Packed => 2,
+            // Fused kernels (Task 007)
+            OpKind::SiluF32 => 2,
+            OpKind::Conv2dRequantReluI8Packed => 3,
         }
     }
 
@@ -153,6 +165,11 @@ impl OpKind {
             OpKind::DequantizeI8ToF32 => dragonwing_shaders::DEQUANTIZE_I8_PACKED_TO_F32,
             OpKind::AddI8Packed => dragonwing_shaders::ADD_I8_PACKED,
             OpKind::ReluI8Packed => dragonwing_shaders::RELU_I8_PACKED,
+            // Fused kernels (Task 007)
+            OpKind::SiluF32 => dragonwing_shaders::SILU_F32,
+            OpKind::Conv2dRequantReluI8Packed => {
+                dragonwing_shaders::CONV2D_REQUANT_RELU_I8_PACKED
+            }
         }
     }
 
@@ -184,6 +201,13 @@ impl OpKind {
             | OpKind::DequantizeI8ToF32
             | OpKind::AddI8Packed
             | OpKind::ReluI8Packed => 16,
+            // Fused kernels (Task 007)
+            OpKind::SiluF32 => 16,
+            // 4× uvec4 (64 B) + float requant_scale (4 B) + uint do_relu (4 B) = 72,
+            // but spec rounds push-constant ranges up to vec4 alignment (16 B).
+            // The fused conv shader declares all fields contiguously in one
+            // block; on most drivers 80 B is the smallest size that holds it.
+            OpKind::Conv2dRequantReluI8Packed => 80,
         }
     }
 }
