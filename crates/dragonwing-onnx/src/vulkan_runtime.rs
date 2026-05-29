@@ -392,6 +392,25 @@ impl VulkanGraphRuntime {
             OpParams::Quantize { scale } => self.dispatch_quantize(op, *scale),
             OpParams::Dequantize { scale } => self.dispatch_dequantize(op, *scale),
 
+            // ----- Fused INT8 ops (Phase 1 of Task 008) ------------------
+            OpParams::Conv2dRequantReluI8Nhwc {
+                kernel_shape,
+                strides,
+                pads,
+                group,
+                requant_scale,
+                has_relu,
+                ..
+            } => self.dispatch_conv2d_requant_relu_i8(
+                op,
+                *kernel_shape,
+                *strides,
+                *pads,
+                *group,
+                *requant_scale,
+                *has_relu,
+            ),
+
             // ----- ops without Vulkan shaders yet (CPU fallback later) ---
             OpParams::Sub
             | OpParams::Div
@@ -851,6 +870,112 @@ impl VulkanGraphRuntime {
         let (input, output) = Self::get_two_buffers(&mut self.buffers, &in_name, &out_name)?;
         dragonwing_vulkan::ops::dequantize_i8_packed_to_f32(&self.backend, input, output, scale)
             .map_err(|e| Error::Runtime(format!("vk dequantize: {e}")))
+    }
+
+    // =========================================================================
+    // Task 008 — Fused INT8 Conv + Requantize + (optional) Relu dispatcher
+    // =========================================================================
+    //
+    // Emitted by the fusion pass when a `Conv → Requantize (→ Relu)` chain is
+    // detected in an INT8 graph. The fused shader
+    // (`conv2d_requant_relu_i8_packed.comp`) reads packed I8 inputs and
+    // weights, accumulates in I32 inside the shader, requantises with the
+    // provided scale, and writes packed I8 directly to the output buffer —
+    // skipping the intermediate I32 tensor that the unfused path would
+    // allocate.
+    //
+    // Constraints (enforced by the underlying op wrapper):
+    //   - `c_in % 4 == 0` and `c_out % 4 == 0` (UINT32 packing).
+    //   - `group == 1` (no depthwise).
+    //   - bias not supported here (must be folded at compile time).
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_conv2d_requant_relu_i8(
+        &mut self,
+        op: &CompiledOp,
+        kernel_shape: [usize; 2],
+        strides: [usize; 2],
+        pads: [usize; 4],
+        group: usize,
+        requant_scale: f32,
+        has_relu: bool,
+    ) -> Result<()> {
+        if op.inputs.len() < 2 || op.outputs.is_empty() {
+            return Err(Error::Runtime(
+                "conv2d_requant_relu_i8: needs ≥2 inputs and 1 output".into(),
+            ));
+        }
+        if group != 1 {
+            return Err(Error::Runtime(format!(
+                "conv2d_requant_relu_i8: group={group} not supported"
+            )));
+        }
+        if op.inputs.len() > 2 && !op.inputs[2].is_empty() {
+            return Err(Error::Runtime(
+                "conv2d_requant_relu_i8: bias must be folded at compile time".into(),
+            ));
+        }
+
+        let in_name = &op.inputs[0];
+        let w_name = &op.inputs[1];
+        let out_name = &op.outputs[0];
+
+        let in_shape = self
+            .graph
+            .shapes
+            .get(in_name)
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {in_name}")))?;
+        let out_shape = self
+            .graph
+            .shapes
+            .get(out_name)
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {out_name}")))?;
+
+        if in_shape.dims.len() != 4 || out_shape.dims.len() != 4 {
+            return Err(Error::Runtime(
+                "conv2d_requant_relu_i8: input and output must be 4D NHWC".into(),
+            ));
+        }
+
+        let n = in_shape.dims[0];
+        let h_in = in_shape.dims[1];
+        let w_in = in_shape.dims[2];
+        let c_in = in_shape.dims[3];
+        let c_out = out_shape.dims[3];
+
+        let k_h = kernel_shape[0];
+        let k_w = kernel_shape[1];
+        let stride_h = strides[0];
+        let stride_w = strides[1];
+        let pad_h = pads[0];
+        let pad_w = pads[1];
+
+        let in_name = in_name.clone();
+        let w_name = w_name.clone();
+        let out_name = out_name.clone();
+        let (input, kernel, output) =
+            Self::get_three_buffers(&mut self.buffers, &in_name, &w_name, &out_name)?;
+
+        dragonwing_vulkan::ops::conv2d_requant_relu_i8_packed(
+            &self.backend,
+            input,
+            kernel,
+            output,
+            n,
+            h_in,
+            w_in,
+            c_in,
+            c_out,
+            k_h,
+            k_w,
+            stride_h,
+            stride_w,
+            pad_h,
+            pad_w,
+            requant_scale,
+            has_relu,
+        )
+        .map_err(|e| Error::Runtime(format!("vk conv2d_requant_relu_i8: {e}")))
     }
 
     /// INT8 ReLU on packed tensors. Not in `OpParams` directly — exposed via a

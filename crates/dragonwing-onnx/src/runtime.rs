@@ -185,6 +185,13 @@ impl<B: Backend> GraphRuntime<B> {
                     op.op_type
                 )));
             }
+            // Fused quantized ops (Task 008) - specialized backends only.
+            OpParams::Conv2dRequantReluI8Nhwc { .. } => {
+                return Err(Error::Runtime(format!(
+                    "{} (fused quantized) requires VulkanGraphRuntime",
+                    op.op_type
+                )));
+            }
         }
         Ok(())
     }
@@ -921,6 +928,16 @@ mod cpu_runtime {
                 }
                 OpParams::Quantize { scale } => self.dispatch_quantize(op, *scale),
                 OpParams::Dequantize { scale } => self.dispatch_dequantize(op, *scale),
+                // Fused quantized ops (Task 008) - not implemented on CPU; require
+                // VulkanGraphRuntime. Emit a clear error so callers know to switch
+                // backends or skip fusion when targeting CPU.
+                OpParams::Conv2dRequantReluI8Nhwc { .. } => {
+                    Err(Error::Runtime(format!(
+                        "{} (fused Conv+Requant+Relu I8) not implemented on CPU; \
+                         use VulkanGraphRuntime or skip the fusion pass",
+                        op.op_type
+                    )))
+                }
             }
         }
 
