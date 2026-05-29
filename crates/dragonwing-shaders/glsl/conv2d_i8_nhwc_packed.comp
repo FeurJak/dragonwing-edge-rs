@@ -1,0 +1,146 @@
+#version 450
+//
+// conv2d_i8_nhwc_packed — INT8 2D convolution with UINT32 packing.
+//
+// Since Adreno A702 lacks VK_KHR_8bit_storage, we pack 4 INT8 values
+// into each UINT32. The packing is along the channel dimension (C),
+// so C must be a multiple of 4.
+//
+// Packing convention (little-endian, along channels):
+//   packed_u32[c/4] contains input[..., c], input[..., c+1], input[..., c+2], input[..., c+3]
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Output[N*H_out*W_out*C_out]      (write-only, INT32)
+//   set=0 binding=1  std430 buffer Input_packed[N*H*W*C_in/4]       (read-only, UINT32)
+//   set=0 binding=2  std430 buffer Kernel_packed[K_h*K_w*C_in*C_out/4] (read-only, UINT32)
+//
+// Push constants (64 bytes):
+//   uvec4 dims0: { h_in, w_in, c_in, c_out }      // c_in must be multiple of 4
+//   uvec4 dims1: { k_h, k_w, stride_h, stride_w }
+//   uvec4 dims2: { pad_h, pad_w, h_out, w_out }
+//   uvec4 dims3: { n, c_in_packed, _, _ }         // c_in_packed = c_in / 4
+//
+// Dispatch:
+//   gx = ceil(w_out / 8), gy = ceil(h_out / 8), gz = n * c_out
+//
+// Workgroup: 8x8x1 = 64 invocations
+//
+// Output is INT32 accumulator; caller is responsible for requantization.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    int output_data[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuf {
+    uint input_packed[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer KernelBuf {
+    uint kernel_packed[];
+};
+
+layout(push_constant) uniform Pc {
+    uvec4 dims0;  // h_in, w_in, c_in, c_out
+    uvec4 dims1;  // k_h, k_w, stride_h, stride_w
+    uvec4 dims2;  // pad_h, pad_w, h_out, w_out
+    uvec4 dims3;  // n, c_in_packed, _, _
+} pc;
+
+// Unpack 4 INT8 values from a UINT32 (little-endian)
+ivec4 unpack_i8x4(uint packed) {
+    int i0 = int(packed & 0xFFu);
+    int i1 = int((packed >> 8u) & 0xFFu);
+    int i2 = int((packed >> 16u) & 0xFFu);
+    int i3 = int((packed >> 24u) & 0xFFu);
+    
+    // Sign extension
+    if (i0 >= 128) i0 -= 256;
+    if (i1 >= 128) i1 -= 256;
+    if (i2 >= 128) i2 -= 256;
+    if (i3 >= 128) i3 -= 256;
+    
+    return ivec4(i0, i1, i2, i3);
+}
+
+void main() {
+    uint h_in = pc.dims0.x;
+    uint w_in = pc.dims0.y;
+    uint c_in = pc.dims0.z;
+    uint c_out = pc.dims0.w;
+    
+    uint k_h = pc.dims1.x;
+    uint k_w = pc.dims1.y;
+    uint stride_h = pc.dims1.z;
+    uint stride_w = pc.dims1.w;
+    
+    uint pad_h = pc.dims2.x;
+    uint pad_w = pc.dims2.y;
+    uint h_out = pc.dims2.z;
+    uint w_out = pc.dims2.w;
+    
+    uint n = pc.dims3.x;
+    uint c_in_packed = pc.dims3.y;  // = c_in / 4
+    
+    // Output position
+    uint ow = gl_GlobalInvocationID.x;
+    uint oh = gl_GlobalInvocationID.y;
+    uint batch_oc = gl_GlobalInvocationID.z;
+    uint batch = batch_oc / c_out;
+    uint oc = batch_oc % c_out;
+    
+    // Bounds check
+    if (ow >= w_out || oh >= h_out || batch >= n) {
+        return;
+    }
+    
+    int acc = 0;
+    
+    // Convolve
+    for (uint kh = 0u; kh < k_h; kh++) {
+        for (uint kw = 0u; kw < k_w; kw++) {
+            // Input position (with padding offset)
+            int ih = int(oh * stride_h + kh) - int(pad_h);
+            int iw = int(ow * stride_w + kw) - int(pad_w);
+            
+            // Skip if outside input bounds (zero-padding)
+            if (ih < 0 || ih >= int(h_in) || iw < 0 || iw >= int(w_in)) {
+                continue;
+            }
+            
+            // Process input channels in groups of 4
+            for (uint ic_pack = 0u; ic_pack < c_in_packed; ic_pack++) {
+                // Input index (packed): [batch, ih, iw, ic_pack] in NHWC packed layout
+                uint input_idx = ((batch * h_in + uint(ih)) * w_in + uint(iw)) * c_in_packed + ic_pack;
+                ivec4 input_vals = unpack_i8x4(input_packed[input_idx]);
+                
+                // Kernel is packed: [kh, kw, ic, oc] where ic is packed
+                // Each pack contains 4 consecutive ic values for a given oc
+                // Kernel index: ((kh * k_w + kw) * c_in_packed + ic_pack) * c_out + oc
+                // But we need to pack differently: kernel[kh,kw,ic:ic+4,oc]
+                //
+                // Actually, let's use a simpler kernel layout:
+                // kernel_packed[((kh * k_w + kw) * c_in + ic) * c_out + oc] for unpacked
+                // For packed: group by ic in packs of 4
+                // kernel_packed[(kh * k_w + kw) * c_in_packed * c_out + ic_pack * c_out + oc]
+                // But this doesn't pack well. Let's pack the kernel differently:
+                //
+                // We pack kernel such that for each (kh,kw,oc), we have c_in/4 UINT32s
+                // Layout: kernel_packed[kh][kw][oc][ic_pack] -> UINT32
+                uint kernel_base = (kh * k_w + kw) * c_out * c_in_packed + oc * c_in_packed + ic_pack;
+                ivec4 kernel_vals = unpack_i8x4(kernel_packed[kernel_base]);
+                
+                // Dot product of 4 INT8 values
+                acc += input_vals.x * kernel_vals.x
+                     + input_vals.y * kernel_vals.y
+                     + input_vals.z * kernel_vals.z
+                     + input_vals.w * kernel_vals.w;
+            }
+        }
+    }
+    
+    // Output index: [batch, oh, ow, oc] in NHWC (unpacked INT32)
+    uint output_idx = ((batch * h_out + oh) * w_out + ow) * c_out + oc;
+    output_data[output_idx] = acc;
+}

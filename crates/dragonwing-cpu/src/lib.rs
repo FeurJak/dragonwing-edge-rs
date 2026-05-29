@@ -191,6 +191,76 @@ impl CpuBuffer {
             )
         }
     }
+
+    // =========================================================================
+    // INT8/INT32 views for quantized inference (Task 006)
+    // =========================================================================
+
+    /// View the buffer as `&[i8]` for INT8 quantized data.
+    #[must_use]
+    pub fn as_i8(&self) -> &[i8] {
+        // SAFETY: Any bit pattern is valid for i8, and i8 has alignment 1.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.data.as_ptr().cast::<i8>(),
+                self.data.len(),
+            )
+        }
+    }
+
+    /// Mutable `&mut [i8]` view for INT8 quantized data.
+    pub fn as_i8_mut(&mut self) -> &mut [i8] {
+        // SAFETY: Any bit pattern is valid for i8, and i8 has alignment 1.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.data.as_mut_ptr().cast::<i8>(),
+                self.data.len(),
+            )
+        }
+    }
+
+    /// View the buffer as `&[i32]` for INT32 accumulators.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len_bytes` is not a multiple of 4.
+    #[must_use]
+    pub fn as_i32(&self) -> &[i32] {
+        assert!(
+            self.data.len() % core::mem::size_of::<i32>() == 0,
+            "CpuBuffer::as_i32: length {} is not a multiple of 4",
+            self.data.len()
+        );
+        // SAFETY: We've checked the length is a multiple of 4, and the
+        // allocator guarantees alignment of at least 4 bytes.
+        // Any bit pattern is valid for i32.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.data.as_ptr().cast::<i32>(),
+                self.data.len() / core::mem::size_of::<i32>(),
+            )
+        }
+    }
+
+    /// Mutable `&mut [i32]` view for INT32 accumulators.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len_bytes` is not a multiple of 4.
+    pub fn as_i32_mut(&mut self) -> &mut [i32] {
+        assert!(
+            self.data.len() % core::mem::size_of::<i32>() == 0,
+            "CpuBuffer::as_i32_mut: length {} is not a multiple of 4",
+            self.data.len()
+        );
+        // SAFETY: See as_i32 — same reasoning.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.data.as_mut_ptr().cast::<i32>(),
+                self.data.len() / core::mem::size_of::<i32>(),
+            )
+        }
+    }
 }
 
 impl BackendBuffer for CpuBuffer {

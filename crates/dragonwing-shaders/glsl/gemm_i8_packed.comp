@@ -1,0 +1,120 @@
+#version 450
+//
+// gemm_i8_packed — INT8 matrix multiplication with UINT32 packing.
+//
+// Since Adreno A702 lacks VK_KHR_8bit_storage, we pack 4 INT8 values
+// into each UINT32. This shader reads packed data, unpacks to INT32,
+// computes the dot product, and outputs INT32 accumulators.
+//
+// Packing convention (little-endian):
+//   packed_u32 = (i8[0] & 0xFF) | ((i8[1] & 0xFF) << 8) | 
+//                ((i8[2] & 0xFF) << 16) | ((i8[3] & 0xFF) << 24)
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer C[m*n]           (write-only, INT32)
+//   set=0 binding=1  std430 buffer A_packed[m*k/4]  (read-only, UINT32)
+//   set=0 binding=2  std430 buffer B_packed[k*n/4]  (read-only, UINT32)
+//
+// Push constants (16 bytes):
+//   uint m
+//   uint n
+//   uint k        // k must be multiple of 4
+//   uint _pad
+//
+// Dispatch:
+//   gx = ceil(n / 8), gy = ceil(m / 8), gz = 1.
+//
+// Workgroup: 8x8x1 = 64 invocations
+//
+// Each invocation computes one output element C[row, col] by reading
+// packed A rows and B columns, unpacking, and accumulating in INT32.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer CBuf {
+    int c[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer ABuf {
+    uint a_packed[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer BBuf {
+    uint b_packed[];
+};
+
+layout(push_constant) uniform Pc {
+    uint m;
+    uint n;
+    uint k;  // Must be multiple of 4
+    uint _pad;
+} pc;
+
+// Unpack 4 INT8 values from a UINT32 (little-endian)
+ivec4 unpack_i8x4(uint packed) {
+    // Extract bytes and sign-extend
+    int i0 = int(packed & 0xFFu);
+    int i1 = int((packed >> 8u) & 0xFFu);
+    int i2 = int((packed >> 16u) & 0xFFu);
+    int i3 = int((packed >> 24u) & 0xFFu);
+    
+    // Sign extension: if value >= 128, subtract 256
+    if (i0 >= 128) i0 -= 256;
+    if (i1 >= 128) i1 -= 256;
+    if (i2 >= 128) i2 -= 256;
+    if (i3 >= 128) i3 -= 256;
+    
+    return ivec4(i0, i1, i2, i3);
+}
+
+void main() {
+    uint col = gl_GlobalInvocationID.x; // [0, n)
+    uint row = gl_GlobalInvocationID.y; // [0, m)
+    
+    if (row >= pc.m || col >= pc.n) {
+        return;
+    }
+    
+    int acc = 0;
+    uint k_packed = pc.k / 4u;  // Number of packed UINT32s per row/col
+    
+    // Process 4 elements at a time (one UINT32 pack)
+    for (uint p = 0u; p < k_packed; p++) {
+        // A is row-major: A[row, p*4:(p+1)*4]
+        // Index into packed buffer: row * k_packed + p
+        uint a_idx = row * k_packed + p;
+        ivec4 a_vals = unpack_i8x4(a_packed[a_idx]);
+        
+        // B is row-major: B[p*4:(p+1)*4, col]
+        // We need 4 elements from rows p*4, p*4+1, p*4+2, p*4+3 at column col
+        // In packed B, each row is n/4 UINT32s wide (if we pack along rows)
+        //
+        // Actually, for GEMM we need to access B column-wise, but B is stored
+        // row-major. The most efficient approach is to also pack B along the
+        // row dimension.
+        //
+        // For a naive approach, we access 4 separate rows:
+        uint b_row0 = (p * 4u + 0u) * (pc.n / 4u) + (col / 4u);
+        uint b_row1 = (p * 4u + 1u) * (pc.n / 4u) + (col / 4u);
+        uint b_row2 = (p * 4u + 2u) * (pc.n / 4u) + (col / 4u);
+        uint b_row3 = (p * 4u + 3u) * (pc.n / 4u) + (col / 4u);
+        
+        uint col_in_pack = col % 4u;
+        
+        ivec4 b0_vals = unpack_i8x4(b_packed[b_row0]);
+        ivec4 b1_vals = unpack_i8x4(b_packed[b_row1]);
+        ivec4 b2_vals = unpack_i8x4(b_packed[b_row2]);
+        ivec4 b3_vals = unpack_i8x4(b_packed[b_row3]);
+        
+        // Extract the specific column element from each row
+        int b0 = b0_vals[col_in_pack];
+        int b1 = b1_vals[col_in_pack];
+        int b2 = b2_vals[col_in_pack];
+        int b3 = b3_vals[col_in_pack];
+        
+        // Accumulate: a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
+        acc += a_vals.x * b0 + a_vals.y * b1 + a_vals.z * b2 + a_vals.w * b3;
+    }
+    
+    c[row * pc.n + col] = acc;
+}

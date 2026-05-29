@@ -1,0 +1,87 @@
+#version 450
+//
+// relu_i8_packed — INT8 ReLU with packed storage.
+//
+// For symmetric quantization with zero_point = 0, ReLU is simply
+// clamping negative values to 0.
+//
+// Formula:
+//   y_i8 = max(0, x_i8)
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Output_packed[n/4]  (write-only, UINT32)
+//   set=0 binding=1  std430 buffer Input_packed[n/4]   (read-only, UINT32)
+//
+// Push constants (16 bytes):
+//   uint n       // Total elements, must be multiple of 4
+//   uint _pad0
+//   uint _pad1
+//   uint _pad2
+//
+// Dispatch:
+//   gx = ceil(n / (64 * 4)), gy = gz = 1
+//
+// Each invocation processes 4 INT8 values.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    uint output_packed[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuf {
+    uint input_packed[];
+};
+
+layout(push_constant) uniform Pc {
+    uint n;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+} pc;
+
+// Unpack 4 INT8 values from a UINT32 (little-endian)
+ivec4 unpack_i8x4(uint packed) {
+    int i0 = int(packed & 0xFFu);
+    int i1 = int((packed >> 8u) & 0xFFu);
+    int i2 = int((packed >> 16u) & 0xFFu);
+    int i3 = int((packed >> 24u) & 0xFFu);
+    
+    // Sign extension
+    if (i0 >= 128) i0 -= 256;
+    if (i1 >= 128) i1 -= 256;
+    if (i2 >= 128) i2 -= 256;
+    if (i3 >= 128) i3 -= 256;
+    
+    return ivec4(i0, i1, i2, i3);
+}
+
+// Pack 4 INT8 values into a UINT32 (little-endian)
+// Note: For ReLU output, values are in [0, 127] so no negative handling needed
+uint pack_i8x4_relu(ivec4 vals) {
+    // ReLU guarantees non-negative, so we can use simpler packing
+    uint b0 = uint(vals.x) & 0xFFu;
+    uint b1 = uint(vals.y) & 0xFFu;
+    uint b2 = uint(vals.z) & 0xFFu;
+    uint b3 = uint(vals.w) & 0xFFu;
+    
+    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+}
+
+void main() {
+    uint pack_idx = gl_GlobalInvocationID.x;
+    uint n_packed = pc.n / 4u;
+    
+    if (pack_idx >= n_packed) {
+        return;
+    }
+    
+    // Unpack input
+    ivec4 vals = unpack_i8x4(input_packed[pack_idx]);
+    
+    // Apply ReLU: max(0, x)
+    ivec4 result = max(vals, ivec4(0));
+    
+    // Pack and write
+    output_packed[pack_idx] = pack_i8x4_relu(result);
+}

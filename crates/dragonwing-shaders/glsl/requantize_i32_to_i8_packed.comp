@@ -1,0 +1,88 @@
+#version 450
+//
+// requantize_i32_to_i8_packed — Requantize INT32 accumulators to packed INT8.
+//
+// After INT8 convolution/GEMM, we have INT32 accumulators. This shader
+// applies a requantization scale and packs 4 INT8 outputs into each UINT32.
+//
+// Formula:
+//   output_i8 = clamp(round(input_i32 * requant_scale), -128, 127)
+//
+// where requant_scale = (scale_input * scale_weight) / scale_output
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Output_packed[n/4]  (write-only, UINT32)
+//   set=0 binding=1  std430 buffer Input[n]            (read-only, INT32)
+//
+// Push constants (16 bytes):
+//   uint n              // Total elements, must be multiple of 4
+//   float requant_scale // (scale_input * scale_weight) / scale_output
+//   uint _pad0
+//   uint _pad1
+//
+// Dispatch:
+//   gx = ceil(n / (64 * 4)), gy = gz = 1
+//
+// Each invocation processes 4 INT32 values and outputs 1 UINT32.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    uint output_packed[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuf {
+    int input_data[];
+};
+
+layout(push_constant) uniform Pc {
+    uint n;
+    float requant_scale;
+    uint _pad0;
+    uint _pad1;
+} pc;
+
+// Pack 4 INT8 values into a UINT32 (little-endian)
+uint pack_i8x4(ivec4 vals) {
+    // Clamp and convert to unsigned bytes
+    uint b0 = uint(clamp(vals.x, -128, 127)) & 0xFFu;
+    uint b1 = uint(clamp(vals.y, -128, 127)) & 0xFFu;
+    uint b2 = uint(clamp(vals.z, -128, 127)) & 0xFFu;
+    uint b3 = uint(clamp(vals.w, -128, 127)) & 0xFFu;
+
+    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+}
+
+void main() {
+    uint pack_idx = gl_GlobalInvocationID.x;
+    uint n_packed = pc.n / 4u;
+
+    if (pack_idx >= n_packed) {
+        return;
+    }
+
+    uint base_idx = pack_idx * 4u;
+
+    // Read 4 INT32 values
+    int i0 = input_data[base_idx + 0u];
+    int i1 = input_data[base_idx + 1u];
+    int i2 = input_data[base_idx + 2u];
+    int i3 = input_data[base_idx + 3u];
+
+    // Scale and round
+    float f0 = float(i0) * pc.requant_scale;
+    float f1 = float(i1) * pc.requant_scale;
+    float f2 = float(i2) * pc.requant_scale;
+    float f3 = float(i3) * pc.requant_scale;
+
+    // Round to nearest integer
+    ivec4 result = ivec4(
+        int(round(f0)),
+        int(round(f1)),
+        int(round(f2)),
+        int(round(f3))
+    );
+
+    // Pack and write
+    output_packed[pack_idx] = pack_i8x4(result);
+}

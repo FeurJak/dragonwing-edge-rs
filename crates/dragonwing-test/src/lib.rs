@@ -35,6 +35,7 @@ pub mod harness;
 pub mod generators;
 pub mod micro_graph;
 pub mod yolo_e2e;
+pub mod int8_e2e;
 
 pub use harness::{ParityTest, TestConfig, TestResult, TestResults};
 pub use micro_graph::{run_cpu, run_cpu_mt, compare_results, MicroGraphResult};

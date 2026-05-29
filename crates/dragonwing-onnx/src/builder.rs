@@ -7,7 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::{OnnxNode, OnnxTensor, DataType};
-use dragonwing_core::Dtype;
+use dragonwing_core::{Dtype, QuantScale, PerChannelScale};
 use std::collections::HashMap;
 
 /// Reason why an op is not supported.
@@ -49,18 +49,34 @@ impl std::fmt::Display for UnsupportedReason {
 }
 
 /// Tensor shape (static, all dimensions known).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TensorShape {
     /// Dimensions.
     pub dims: Vec<usize>,
     /// Data type.
     pub dtype: Dtype,
+    /// Per-tensor quantization scale (for I8 dtype).
+    /// Used for activations in quantized inference.
+    pub scale: Option<QuantScale>,
+    /// Per-channel quantization scales (for I8 weight tensors).
+    /// One scale per output channel.
+    pub per_channel_scales: Option<PerChannelScale>,
 }
 
 impl TensorShape {
     /// Create a new shape.
     pub fn new(dims: Vec<usize>, dtype: Dtype) -> Self {
-        Self { dims, dtype }
+        Self { dims, dtype, scale: None, per_channel_scales: None }
+    }
+
+    /// Create a new shape with per-tensor quantization scale.
+    pub fn new_quantized(dims: Vec<usize>, scale: QuantScale) -> Self {
+        Self { dims, dtype: Dtype::I8, scale: Some(scale), per_channel_scales: None }
+    }
+
+    /// Create a new shape with per-channel quantization scales (for weights).
+    pub fn new_quantized_per_channel(dims: Vec<usize>, scales: PerChannelScale) -> Self {
+        Self { dims, dtype: Dtype::I8, scale: None, per_channel_scales: Some(scales) }
     }
 
     /// Total number of elements.
@@ -71,6 +87,23 @@ impl TensorShape {
     /// Size in bytes.
     pub fn size_bytes(&self) -> usize {
         self.numel() * self.dtype.size_bytes()
+    }
+
+    /// Returns true if this tensor is quantized.
+    pub fn is_quantized(&self) -> bool {
+        self.dtype.is_quantized()
+    }
+
+    /// Set the per-tensor quantization scale.
+    pub fn with_scale(mut self, scale: QuantScale) -> Self {
+        self.scale = Some(scale);
+        self
+    }
+
+    /// Set the per-channel quantization scales.
+    pub fn with_per_channel_scales(mut self, scales: PerChannelScale) -> Self {
+        self.per_channel_scales = Some(scales);
+        self
     }
 }
 
@@ -273,6 +306,31 @@ pub enum OpParams {
         axes: Vec<usize>,
         /// Steps.
         steps: Vec<isize>,
+    },
+    // =========================================================================
+    // Quantized op parameters (Task 006)
+    // =========================================================================
+    /// Requantization: INT32 accumulator → INT8.
+    Requantize {
+        /// Requantization scale: (input_scale * weight_scale) / output_scale.
+        scale: f32,
+    },
+    /// Quantized Add with scale adjustment.
+    AddQuantized {
+        /// Scale ratio for first input: scale_a / scale_out.
+        scale_a_over_out: f32,
+        /// Scale ratio for second input: scale_b / scale_out.
+        scale_b_over_out: f32,
+    },
+    /// Quantize F32 → INT8.
+    Quantize {
+        /// Quantization scale.
+        scale: f32,
+    },
+    /// Dequantize INT8 → F32.
+    Dequantize {
+        /// Dequantization scale.
+        scale: f32,
     },
 }
 

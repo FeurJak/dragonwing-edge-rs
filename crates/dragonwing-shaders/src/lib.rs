@@ -163,6 +163,70 @@ pub const RELU_FP16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/relu_fp16
 /// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
 pub const ADD_FP16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_fp16.spv"));
 
+// ===========================================================================
+// INT8 quantized shaders (Task 006)
+//
+// These shaders use UINT32 packing to work around lack of VK_KHR_8bit_storage
+// on Adreno A702. Four INT8 values are packed into each UINT32.
+// ===========================================================================
+
+/// `gemm_i8_packed` — INT8 matrix multiplication with UINT32 packing.
+///
+/// Reads packed INT8 data (4 values per UINT32), accumulates in INT32.
+/// Push-constant layout: `{ uint m; uint n; uint k; uint _; }` (k must be multiple of 4).
+/// Dispatch: `gx = ceil(n / 8), gy = ceil(m / 8), gz = 1`.
+pub const GEMM_I8_PACKED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_i8_packed.spv"));
+
+/// `conv2d_i8_nhwc_packed` — INT8 2D convolution with UINT32 packing.
+///
+/// Input/kernel packed along channel dimension (C must be multiple of 4).
+/// Output is INT32 accumulator; caller handles requantization.
+/// Push-constant layout: 64 bytes (4 uvec4).
+/// Dispatch: `gx = ceil(w_out/8), gy = ceil(h_out/8), gz = n * c_out`.
+pub const CONV2D_I8_NHWC_PACKED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/conv2d_i8_nhwc_packed.spv"));
+
+/// `requantize_i32_to_i8_packed` — Requantize INT32 accumulators to packed INT8.
+///
+/// Applies scale and packs 4 INT8 outputs into each UINT32.
+/// Push-constant layout: `{ uint n; float requant_scale; uint _; uint _; }`.
+/// Dispatch: `gx = ceil(n / (64 * 4)), gy = gz = 1`.
+pub const REQUANTIZE_I32_TO_I8_PACKED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/requantize_i32_to_i8_packed.spv"));
+
+/// `dequantize_i8_packed_to_f32` — Convert packed INT8 to F32.
+///
+/// Reads packed INT8 (4 per UINT32) and outputs F32.
+/// Push-constant layout: `{ uint n; float scale; uint _; uint _; }`.
+/// Dispatch: `gx = ceil(n / 64), gy = gz = 1`.
+pub const DEQUANTIZE_I8_PACKED_TO_F32: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/dequantize_i8_packed_to_f32.spv"));
+
+/// `quantize_f32_to_i8_packed` — Convert F32 to packed INT8.
+///
+/// Reads F32 and outputs packed INT8 (4 per UINT32).
+/// Push-constant layout: `{ uint n; float inv_scale; uint _; uint _; }`.
+/// Dispatch: `gx = ceil(n / (64 * 4)), gy = gz = 1`.
+pub const QUANTIZE_F32_TO_I8_PACKED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/quantize_f32_to_i8_packed.spv"));
+
+/// `add_i8_packed` — INT8 element-wise addition with requantization.
+///
+/// Adds two packed INT8 tensors, requantizes to output scale.
+/// Push-constant layout: `{ uint n; float scale_a_over_y; float scale_b_over_y; uint _; }`.
+/// Dispatch: `gx = ceil(n / (64 * 4)), gy = gz = 1`.
+pub const ADD_I8_PACKED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/add_i8_packed.spv"));
+
+/// `relu_i8_packed` — INT8 ReLU with packed storage.
+///
+/// max(0, x) for packed INT8 data.
+/// Push-constant layout: `{ uint n; uint _; uint _; uint _; }`.
+/// Dispatch: `gx = ceil(n / (64 * 4)), gy = gz = 1`.
+pub const RELU_I8_PACKED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/relu_i8_packed.spv"));
+
 /// Convenience: every shader byte-slice in the crate, indexed by a
 /// stable string id. Useful for a `--list-shaders` developer tool.
 pub const ALL: &[(&str, &[u8])] = &[
@@ -183,6 +247,14 @@ pub const ALL: &[(&str, &[u8])] = &[
     ("relu_fp16", RELU_FP16),
     ("add_fp16", ADD_FP16),
     ("gemm_fp16", GEMM_FP16),
+    // INT8 packed shaders (Task 006)
+    ("gemm_i8_packed", GEMM_I8_PACKED),
+    ("conv2d_i8_nhwc_packed", CONV2D_I8_NHWC_PACKED),
+    ("requantize_i32_to_i8_packed", REQUANTIZE_I32_TO_I8_PACKED),
+    ("dequantize_i8_packed_to_f32", DEQUANTIZE_I8_PACKED_TO_F32),
+    ("quantize_f32_to_i8_packed", QUANTIZE_F32_TO_I8_PACKED),
+    ("add_i8_packed", ADD_I8_PACKED),
+    ("relu_i8_packed", RELU_I8_PACKED),
 ];
 
 #[cfg(test)]

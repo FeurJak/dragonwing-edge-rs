@@ -177,6 +177,14 @@ impl<B: Backend> GraphRuntime<B> {
                     op.op_type
                 )));
             }
+            // Quantized ops (Task 006) - defer to specialized runtime
+            OpParams::Requantize { .. } | OpParams::AddQuantized { .. } |
+            OpParams::Quantize { .. } | OpParams::Dequantize { .. } => {
+                return Err(Error::Runtime(format!(
+                    "{} (quantized) not implemented in generic runtime",
+                    op.op_type
+                )));
+            }
         }
         Ok(())
     }
@@ -906,6 +914,13 @@ mod cpu_runtime {
                 OpParams::Slice { starts, ends, axes, steps } => {
                     self.dispatch_slice(op, starts, ends, axes, steps)
                 }
+                // Quantized ops (Task 006)
+                OpParams::Requantize { scale } => self.dispatch_requantize(op, *scale),
+                OpParams::AddQuantized { scale_a_over_out, scale_b_over_out } => {
+                    self.dispatch_add_quantized(op, *scale_a_over_out, *scale_b_over_out)
+                }
+                OpParams::Quantize { scale } => self.dispatch_quantize(op, *scale),
+                OpParams::Dequantize { scale } => self.dispatch_dequantize(op, *scale),
             }
         }
 
@@ -2121,6 +2136,108 @@ mod cpu_runtime {
         /// Get the output tensor names.
         pub fn outputs(&self) -> &[String] {
             &self.graph.outputs
+        }
+
+        // =====================================================================
+        // INT8 Quantized Op Dispatchers (Task 006)
+        // =====================================================================
+
+        fn dispatch_requantize(&mut self, op: &CompiledOp, scale: f32) -> Result<()> {
+            let input_name = &op.inputs[0];
+            let output_name = &op.outputs[0];
+
+            let n = self.graph.shapes.get(input_name)
+                .map(|s| s.numel())
+                .unwrap_or(0);
+
+            // Get buffers
+            let (input_ptr, output_ptr) = {
+                let input_buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                let output_buf = self.buffers.get(output_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {output_name}")))?;
+                (input_buf as *const CpuBuffer, output_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+
+            // Input is INT32, output is INT8
+            let input_i32 = unsafe { (*input_ptr).as_i32() };
+            let output_i8 = unsafe { (*output_ptr).as_i8_mut() };
+
+            ops::requantize_i32_to_i8(output_i8, input_i32, scale);
+            Ok(())
+        }
+
+        fn dispatch_add_quantized(
+            &mut self,
+            op: &CompiledOp,
+            scale_a_over_out: f32,
+            scale_b_over_out: f32,
+        ) -> Result<()> {
+            let a_name = &op.inputs[0];
+            let b_name = &op.inputs[1];
+            let out_name = &op.outputs[0];
+
+            // Get buffers
+            let (a_ptr, b_ptr, out_ptr) = {
+                let a_buf = self.buffers.get(a_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {a_name}")))?;
+                let b_buf = self.buffers.get(b_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {b_name}")))?;
+                let out_buf = self.buffers.get(out_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {out_name}")))?;
+                (
+                    a_buf as *const CpuBuffer,
+                    b_buf as *const CpuBuffer,
+                    out_buf as *const CpuBuffer as *mut CpuBuffer,
+                )
+            };
+
+            let a_i8 = unsafe { (*a_ptr).as_i8() };
+            let b_i8 = unsafe { (*b_ptr).as_i8() };
+            let out_i8 = unsafe { (*out_ptr).as_i8_mut() };
+
+            ops::add_i8(out_i8, a_i8, b_i8, scale_a_over_out, scale_b_over_out);
+            Ok(())
+        }
+
+        fn dispatch_quantize(&mut self, op: &CompiledOp, scale: f32) -> Result<()> {
+            let input_name = &op.inputs[0];
+            let output_name = &op.outputs[0];
+
+            // Get buffers
+            let (input_ptr, output_ptr) = {
+                let input_buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                let output_buf = self.buffers.get(output_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {output_name}")))?;
+                (input_buf as *const CpuBuffer, output_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+
+            let input_f32 = unsafe { (*input_ptr).as_f32() };
+            let output_i8 = unsafe { (*output_ptr).as_i8_mut() };
+
+            ops::quantize_f32_to_i8(output_i8, input_f32, scale);
+            Ok(())
+        }
+
+        fn dispatch_dequantize(&mut self, op: &CompiledOp, scale: f32) -> Result<()> {
+            let input_name = &op.inputs[0];
+            let output_name = &op.outputs[0];
+
+            // Get buffers
+            let (input_ptr, output_ptr) = {
+                let input_buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                let output_buf = self.buffers.get(output_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {output_name}")))?;
+                (input_buf as *const CpuBuffer, output_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+
+            let input_i8 = unsafe { (*input_ptr).as_i8() };
+            let output_f32 = unsafe { (*output_ptr).as_f32_mut() };
+
+            ops::dequantize_i8_to_f32(output_f32, input_i8, scale);
+            Ok(())
         }
     }
 }

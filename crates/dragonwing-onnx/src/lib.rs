@@ -39,6 +39,27 @@
 //! - `Softmax` (last axis only)
 //! - `Reshape`, `Flatten` (metadata only, no runtime op)
 //! - `BatchNormalization` (folded into preceding Conv at load time)
+//!
+//! # INT8 Quantization (Task 006)
+//!
+//! The [`calibration`] module provides tools for post-training quantization:
+//!
+//! ```ignore
+//! use dragonwing_onnx::{load_model, compile_model, Calibrator};
+//! use dragonwing_core::Dtype;
+//!
+//! let model = load_model("model.onnx")?;
+//! let graph = compile_model(&model, Dtype::F32)?;
+//! let mut calibrator = Calibrator::new(graph)?;
+//!
+//! // Feed calibration images
+//! for image in calibration_images {
+//!     calibrator.feed("input", &image)?;
+//! }
+//!
+//! // Compute quantization parameters
+//! let params = calibrator.compute_params()?;
+//! ```
 
 #![warn(missing_docs)]
 
@@ -50,6 +71,10 @@ mod graph;
 mod runtime;
 mod postprocess;
 mod fusion;
+#[cfg(feature = "cpu")]
+mod calibration;
+#[cfg(feature = "cpu")]
+mod quantize;
 
 pub use error::{Error, Result};
 pub use model::{Model, OnnxNode, OnnxTensor, OnnxAttribute, AttributeValue, DataType};
@@ -62,6 +87,14 @@ pub use fusion::{apply_fusion_passes, count_fuseable_patterns, FusionStats};
 /// CPU-optimized graph runtime (requires `cpu` feature).
 #[cfg(feature = "cpu")]
 pub use runtime::CpuGraphRuntime;
+
+/// Calibration tools for INT8 quantization (requires `cpu` feature).
+#[cfg(feature = "cpu")]
+pub use calibration::{Calibrator, CalibrationStrategy};
+
+/// Quantized graph compiler for INT8 inference (requires `cpu` feature).
+#[cfg(feature = "cpu")]
+pub use quantize::{QuantizedGraphCompiler, QuantizedGraphInfo};
 
 use std::path::Path;
 
