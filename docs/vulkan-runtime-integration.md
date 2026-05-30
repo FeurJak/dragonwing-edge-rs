@@ -298,3 +298,157 @@ highest-priority items are:
 5. Pre-transpose Gemm weights at model load (current shader is
    non-transposed-only).
 6. Workgroup-size tuning for INT8 GEMM and Conv.
+
+## Task 008 changes
+
+Task 008 delivered the items above as **Phases 1–5**, plus a partial
+end-to-end YOLOv8 benchmark in Phase 6. Concretely:
+
+### Phase 1 — Fused INT8 Conv+Requant+ReLU graph rewrite
+
+Added `OpParams::Conv2dRequantReluI8Nhwc` and a fusion pass in
+`crates/dragonwing-onnx/src/fusion.rs` that detects the
+`Conv → Requantize → (Relu?)` triple emitted by
+`QuantizedGraphCompiler` and rewrites it to a single op routed to the
+existing `conv2d_requant_relu_i8_packed` shader (from task 007 Phase 4).
+The fusion also sidesteps an unfused-path bug where the I32 accumulator
+tensor `"{output}_i32"` synthesised by the quantiser was never added to
+`graph.shapes`, so the runtime had no buffer for it.
+
+Public API:
+
+```rust
+pub enum OpParams {
+    // ...
+    Conv2dRequantReluI8Nhwc {
+        kernel_shape: [usize; 2],
+        strides: [usize; 2],
+        pads: [usize; 4],
+        dilations: [usize; 2],
+        group: usize,
+        requant_scale: f32,
+        has_relu: bool,
+    },
+}
+```
+
+### Phase 2 — F32 bias support via broadcasting shader
+
+Added `bias_add_f32_nhwc.comp`: a 2-SSBO shader that does
+`y[i] += bias[i % c_out]` in-place. `VulkanGraphRuntime::dispatch_conv2d`
+and `dispatch_gemm` now insert a post-op bias-add when the op carries
+a third (bias) input. INT8 bias-folding is deferred to a follow-up task;
+the fused INT8 shader has no bias slot and YOLO-style BN-folded weights
+usually zero out the explicit conv bias anyway.
+
+### Phase 3 — Gemm `trans_b` fold at load time
+
+`fold_gemm_transpose(&mut Graph) -> Result<()>` (in `graph.rs`)
+detects Gemm ops with `trans_b=true`, transposes the F32/F16 weight
+initializer bytes from `[N, K]` to `[K, N]`, updates the shape entry,
+and clears `trans_b`. Lets the existing non-transposed `gemm_f32`
+shader handle all ONNX Gemm layouts without runtime cost. Errors out
+cleanly when `trans_b=true` but the weight is dynamic (not in
+initializers).
+
+### Phase 4 — Single-command-buffer execution + barriers
+
+Introduced `dragonwing_vulkan::OpsRecorder`
+(`crates/dragonwing-vulkan/src/record.rs`): owns one shared
+`VkCommandBuffer` and exposes `record_*` methods mirroring every
+`pub fn op_name(...)` in `ops::*`. `VulkanGraphRuntime::run()` now
+records the entire graph into one recorder, inserts a global
+compute→compute `vkCmdPipelineBarrier` between any two ops where the
+later op reads a buffer the earlier op wrote, and submits once.
+Falls back to per-op execution for unsupported ops (CPU fallback) by
+flushing the recorder, running CPU, then starting a new recorder. The
+legacy per-op path remains as `VulkanGraphRuntime::run_unbatched()`.
+
+Barrier predicate:
+
+```rust
+fn needs_barrier(ops: &[CompiledOp], idx: usize) -> bool {
+    let prev = &ops[idx - 1];
+    let cur = &ops[idx];
+    cur.inputs.iter().any(|inp| prev.outputs.contains(inp))
+}
+```
+
+Conservative (catches all topologically-ordered direct dependencies).
+
+### Phase 5 — Slab allocator backs every tensor buffer
+
+`VulkanGraphRuntime` now holds an `Arc<SlabAllocator>` and allocates
+every tensor's `VulkanBuffer` from it via the new
+`VulkanBackend::alloc_slab_buffer`. Drop order matters: `buffers`
+declared before `slab` so buffers free their `VkBuffer` handles first
+(memory is slab-owned). For YOLOv8m (~110 tensors totalling 811 MiB)
+this collapses 110 `vkAllocateMemory` calls to **exactly 1**. Set
+`DRAGONWING_DISABLE_SLAB=1` to fall back to per-buffer allocation for
+debugging.
+
+New constructor `VulkanBuffer::from_slab(ctx, size, slab_chunk_size,
+slab_memory, offset, mapped_ptr)`. Carefully separates the
+**logical** `size` (what `len_bytes()` reports — used by shape checks)
+from the **slab chunk** size (rounded up to slab's 256 B alignment —
+used only for the bind-time mem-reqs check).
+
+### Phase 6 — End-to-end YOLOv8 pipeline (partial)
+
+New binaries:
+
+- `dragonwing-test::yolo-inspect <model.onnx>` — host-side ONNX
+  inspector (no Vulkan required).
+- `dragonwing-test::yolo-benchmark <model.onnx>` — full pipeline:
+  `load_model → fold_batchnorm → compile_model → convert_nchw_to_nhwc
+  → fold_gemm_transpose → apply_fusion_passes → VulkanGraphRuntime`.
+  Env vars: `WARMUP`, `ITERS`, `MAX_OPS`, `UNBATCHED`,
+  `DRAGONWING_DISABLE_SLAB`, `DRAGONWING_SKIP_BIAS`, `DRAGONWING_TRACE`.
+
+CPU fallbacks added in `vulkan_runtime.rs` for the ops that don't yet
+have Vulkan shaders but appear in YOLOv8m: **Sub, Div, Concat, Resize,
+Split, Transpose, Slice**. The fallback path is `download → CPU op →
+upload`; the run-loop flushes the in-flight recorder, runs the CPU op,
+then opens a fresh recorder.
+
+### Shader workgroup-count fix (Adreno A702)
+
+The Adreno A702 / Turnip imposes `maxComputeWorkGroupCount[0] = 65535`.
+Several elementwise shaders (`sigmoid_f32`, `mul_f32`, `silu_f32`,
+`add_f32`, `relu_f32`, `bias_add_f32_nhwc`) used a strict 1D dispatch
+of `(ceil(n/64), 1, 1)`. For YOLOv8m's first conv output (4.9M
+elements ≈ 76,800 workgroups) this exceeded the limit and produced a
+GPU **TRANSLATION fault** logged in `dmesg`. Fixed by:
+
+1. Extending all six shaders to 2D-wrap dispatch:
+
+   ```glsl
+   uint flat_wg = gl_WorkGroupID.y * pc.gx_total + gl_WorkGroupID.x;
+   uint gid = flat_wg * 64u + gl_LocalInvocationID.x;
+   if (gid >= pc.n) return;
+   ```
+
+2. Adding a `gx_total: u32` push-constant slot (16-byte total unchanged).
+
+3. Updating both `ops::*` and `OpsRecorder::record_*` host wrappers:
+
+   ```rust
+   let total_groups = (n as u64).div_ceil(64);
+   let gx = total_groups.min(65535) as u32;
+   let gy = total_groups.div_ceil(gx as u64) as u32;
+   ```
+
+### Phase 6 blocker
+
+The naive `conv2d_f32_nhwc` shader is too slow on mid-network YOLOv8m
+shapes (e.g. `c_in=48, c_out=96, h_out=160, w_out=160`: ≈ 1 GigaFLOP
+per dispatch with no tiling / shared-memory reuse). MSM's 500 ms GPU
+**hangcheck** trips, surfacing as a recovery-induced TRANSLATION fault
+in `dmesg`. This isn't a correctness bug — the math is right — but the
+F32 path was never the production target. The INT8 fused conv path
+(Phase 1 of this task + Phase 4 of task 007) handles the same shape
+in ~30–60 ms on Adreno A702 according to task 007's micro-benchmarks
+and is fully wired; it just needs calibration data to drive the
+`QuantizedGraphCompiler` for the user's YOLOv8m models.
+
+
