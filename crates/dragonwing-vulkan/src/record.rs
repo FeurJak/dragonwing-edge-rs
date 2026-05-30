@@ -256,10 +256,10 @@ impl OpsRecorder {
             ));
         }
         let n = x.len_bytes() / 4;
-        // ReluF32 has 1 SSBO (inout); use alloc_and_bind with an empty input list.
         let (cached, desc_set) = self.alloc_and_bind(OpKind::ReluF32, x.vk_buffer(), &[])?;
-        let pc: [u8; 16] = push_n_u32(n as u32);
-        let groups = ((n as u32).div_ceil(64), 1, 1);
+        let (gx, gy) = wide_dispatch_xy(n);
+        let pc = push_2_u32(n as u32, gx);
+        let groups = (gx, gy, 1);
         self.record_pipeline_dispatch(cached, desc_set, &pc, groups);
         Ok(())
     }
@@ -276,8 +276,9 @@ impl OpsRecorder {
         let n = a.len_bytes() / 4;
         let (cached, desc_set) =
             self.alloc_and_bind(OpKind::AddF32, y.vk_buffer(), &[a.vk_buffer(), b.vk_buffer()])?;
-        let pc = push_n_u32(n as u32);
-        let groups = ((n as u32).div_ceil(64), 1, 1);
+        let (gx, gy) = wide_dispatch_xy(n);
+        let pc = push_2_u32(n as u32, gx);
+        let groups = (gx, gy, 1);
         self.record_pipeline_dispatch(cached, desc_set, &pc, groups);
         Ok(())
     }
@@ -294,8 +295,9 @@ impl OpsRecorder {
         let n = a.len_bytes() / 4;
         let (cached, desc_set) =
             self.alloc_and_bind(OpKind::MulF32, y.vk_buffer(), &[a.vk_buffer(), b.vk_buffer()])?;
-        let pc = push_n_u32(n as u32);
-        let groups = ((n as u32).div_ceil(64), 1, 1);
+        let (gx, gy) = wide_dispatch_xy(n);
+        let pc = push_2_u32(n as u32, gx);
+        let groups = (gx, gy, 1);
         self.record_pipeline_dispatch(cached, desc_set, &pc, groups);
         Ok(())
     }
@@ -310,8 +312,9 @@ impl OpsRecorder {
         let n = input.len_bytes() / 4;
         let (cached, desc_set) =
             self.alloc_and_bind(OpKind::SigmoidF32, output.vk_buffer(), &[input.vk_buffer()])?;
-        let pc = push_n_u32(n as u32);
-        let groups = ((n as u32).div_ceil(64), 1, 1);
+        let (gx, gy) = wide_dispatch_xy(n);
+        let pc = push_2_u32(n as u32, gx);
+        let groups = (gx, gy, 1);
         self.record_pipeline_dispatch(cached, desc_set, &pc, groups);
         Ok(())
     }
@@ -326,8 +329,9 @@ impl OpsRecorder {
         let n = input.len_bytes() / 4;
         let (cached, desc_set) =
             self.alloc_and_bind(OpKind::SiluF32, output.vk_buffer(), &[input.vk_buffer()])?;
-        let pc = push_n_u32(n as u32);
-        let groups = ((n as u32).div_ceil(64), 1, 1);
+        let (gx, gy) = wide_dispatch_xy(n);
+        let pc = push_2_u32(n as u32, gx);
+        let groups = (gx, gy, 1);
         self.record_pipeline_dispatch(cached, desc_set, &pc, groups);
         Ok(())
     }
@@ -438,13 +442,16 @@ impl OpsRecorder {
                 "record_bias_add_f32_nhwc: total {n} not divisible by c_out {c_out}"
             )));
         }
+        // See ops::bias_add_f32_nhwc for the rationale on 2D dispatch.
+        let (gx, gy) = wide_dispatch_xy(n);
+
         let (cached, desc_set) = self.alloc_and_bind(
             OpKind::BiasAddF32Nhwc,
             y_inout.vk_buffer(),
             &[bias.vk_buffer()],
         )?;
-        let pc = push_2_u32(n as u32, c_out as u32);
-        let groups = ((n as u32).div_ceil(64), 1, 1);
+        let pc = push_3_u32(n as u32, c_out as u32, gx);
+        let groups = (gx, gy, 1);
         self.record_pipeline_dispatch(cached, desc_set, &pc, groups);
         Ok(())
     }
@@ -713,6 +720,17 @@ fn check_same_size_2(label: &str, a: &VulkanBuffer, b: &VulkanBuffer) -> Result<
     Ok(())
 }
 
+/// Compute (gx, gy) for a 1D-conceptual dispatch over `n` elements with a
+/// 64-wide workgroup, wrapping into 2D to stay below Adreno's
+/// maxComputeWorkGroupCount[0] = 65535.
+fn wide_dispatch_xy(n: usize) -> (u32, u32) {
+    let total_groups = (n as u64).div_ceil(64);
+    let gx = total_groups.min(65535) as u32;
+    let gy = total_groups.div_ceil(gx.max(1) as u64) as u32;
+    (gx, gy)
+}
+
+#[allow(dead_code)]
 fn push_n_u32(n: u32) -> [u8; 16] {
     let mut out = [0u8; 16];
     out[0..4].copy_from_slice(&n.to_le_bytes());

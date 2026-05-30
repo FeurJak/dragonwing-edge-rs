@@ -68,6 +68,8 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
     let quantize = std::env::var("QUANTIZE").is_ok();
+    let unbatched = std::env::var("UNBATCHED").is_ok();
+    let max_ops: Option<usize> = std::env::var("MAX_OPS").ok().and_then(|v| v.parse().ok());
 
     println!("=== dragonwing-edge yolo-benchmark (Task 008 Phase 6) ===");
     println!("Loading {path}...");
@@ -114,6 +116,19 @@ fn main() {
 
     if quantize {
         println!("\n[Pass 5] (skipped — QUANTIZE env requested but no calib file path implemented yet)");
+    }
+
+    if let Some(limit) = max_ops {
+        let total = graph.ops.len();
+        if limit < total {
+            graph.ops.truncate(limit);
+            println!("\n[Truncate] keeping first {limit} of {total} ops for debug");
+            if let Some(last_op) = graph.ops.last() {
+                if let Some(out_name) = last_op.outputs.first() {
+                    graph.outputs = vec![out_name.clone()];
+                }
+            }
+        }
     }
 
     println!("\n[Pass 6] apply_fusion_passes");
@@ -190,6 +205,17 @@ fn main() {
     // we'd compute the NCHW form first and call transpose_nchw_to_nhwc here.)
     let _ = transpose_nchw_to_nhwc; // silence unused warning
 
+    let do_run = |rt: &mut VulkanGraphRuntime| -> Result<(), String> {
+        if unbatched {
+            rt.run_unbatched().map_err(|e| e.to_string())
+        } else {
+            rt.run().map_err(|e| e.to_string())
+        }
+    };
+    if unbatched {
+        println!("(running in UNBATCHED mode)");
+    }
+
     println!("\n[Warmup] {warmup_n} iterations");
     for i in 0..warmup_n {
         rt.set_input_f32(&input_name, &input_data)
@@ -198,7 +224,7 @@ fn main() {
                 std::process::exit(1);
             });
         let t = Instant::now();
-        rt.run().unwrap_or_else(|e| {
+        do_run(&mut rt).unwrap_or_else(|e| {
             eprintln!("warmup run {i} failed: {e}");
             std::process::exit(1);
         });
@@ -211,7 +237,7 @@ fn main() {
     for _ in 0..iters_n {
         rt.set_input_f32(&input_name, &input_data).expect("set");
         let t = Instant::now();
-        rt.run().expect("run");
+        do_run(&mut rt).expect("run");
         samples.push(t.elapsed());
     }
     print_stats("yolo_e2e", summarise(samples));

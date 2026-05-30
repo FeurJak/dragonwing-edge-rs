@@ -371,17 +371,21 @@ pub fn relu_f32(backend: &VulkanBackend, x: &mut VulkanBuffer) -> Result<()> {
     one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
-    // Push constants: must match shader layout (16 bytes with padding).
+    // 2D-wrap dispatch to avoid Adreno's maxComputeWorkGroupCount[0]=65535.
+    let total_groups = (n as u64).div_ceil(64);
+    let gx = total_groups.min(65535) as u32;
+    let gy = total_groups.div_ceil(gx as u64) as u32;
+
     #[repr(C)]
     struct PushRelu {
         n: u32,
-        _pad0: u32,
+        gx_total: u32,
         _pad1: u32,
         _pad2: u32,
     }
     let pc = PushRelu {
         n: n as u32,
-        _pad0: 0,
+        gx_total: gx,
         _pad1: 0,
         _pad2: 0,
     };
@@ -406,8 +410,7 @@ pub fn relu_f32(backend: &VulkanBackend, x: &mut VulkanBuffer) -> Result<()> {
             0,
             pc_bytes,
         );
-        let groups = (n as u32).div_ceil(64);
-        device.cmd_dispatch(one_shot.cmd, groups, 1, 1);
+        device.cmd_dispatch(one_shot.cmd, gx, gy, 1);
     }
 
     one_shot.end()?;
@@ -1590,9 +1593,13 @@ pub fn sigmoid_f32(
     one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
+    let total_groups = (n as u64).div_ceil(64);
+    let gx = total_groups.min(65535) as u32;
+    let gy = total_groups.div_ceil(gx as u64) as u32;
+
     #[repr(C)]
-    struct PushSigmoid { n: u32, _p0: u32, _p1: u32, _p2: u32 }
-    let pc = PushSigmoid { n: n as u32, _p0: 0, _p1: 0, _p2: 0 };
+    struct PushSigmoid { n: u32, gx_total: u32, _p1: u32, _p2: u32 }
+    let pc = PushSigmoid { n: n as u32, gx_total: gx, _p1: 0, _p2: 0 };
     let pc_bytes: &[u8] = unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), 16) };
 
     let device = backend.context().device();
@@ -1600,7 +1607,7 @@ pub fn sigmoid_f32(
         device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
         device.cmd_bind_descriptor_sets(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.layout, 0, &[desc_set], &[]);
         device.cmd_push_constants(one_shot.cmd, cached.layout, vk::ShaderStageFlags::COMPUTE, 0, pc_bytes);
-        device.cmd_dispatch(one_shot.cmd, (n as u32).div_ceil(64), 1, 1);
+        device.cmd_dispatch(one_shot.cmd, gx, gy, 1);
     }
     one_shot.end()?;
     one_shot.submit()
@@ -1637,9 +1644,13 @@ pub fn mul_f32(
     one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
+    let total_groups = (n as u64).div_ceil(64);
+    let gx = total_groups.min(65535) as u32;
+    let gy = total_groups.div_ceil(gx as u64) as u32;
+
     #[repr(C)]
-    struct PushMul { n: u32, _p0: u32, _p1: u32, _p2: u32 }
-    let pc = PushMul { n: n as u32, _p0: 0, _p1: 0, _p2: 0 };
+    struct PushMul { n: u32, gx_total: u32, _p1: u32, _p2: u32 }
+    let pc = PushMul { n: n as u32, gx_total: gx, _p1: 0, _p2: 0 };
     let pc_bytes: &[u8] = unsafe { std::slice::from_raw_parts((&raw const pc).cast::<u8>(), 16) };
 
     let device = backend.context().device();
@@ -1647,7 +1658,7 @@ pub fn mul_f32(
         device.cmd_bind_pipeline(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.pipeline);
         device.cmd_bind_descriptor_sets(one_shot.cmd, vk::PipelineBindPoint::COMPUTE, cached.layout, 0, &[desc_set], &[]);
         device.cmd_push_constants(one_shot.cmd, cached.layout, vk::ShaderStageFlags::COMPUTE, 0, pc_bytes);
-        device.cmd_dispatch(one_shot.cmd, (n as u32).div_ceil(64), 1, 1);
+        device.cmd_dispatch(one_shot.cmd, gx, gy, 1);
     }
     one_shot.end()?;
     one_shot.submit()
@@ -2225,16 +2236,20 @@ pub fn silu_f32(
     one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
+    let total_groups = (n as u64).div_ceil(64);
+    let gx = total_groups.min(65535) as u32;
+    let gy = total_groups.div_ceil(gx as u64) as u32;
+
     #[repr(C)]
     struct PushSilu {
         n: u32,
-        _p0: u32,
+        gx_total: u32,
         _p1: u32,
         _p2: u32,
     }
     let pc = PushSilu {
         n: n as u32,
-        _p0: 0,
+        gx_total: gx,
         _p1: 0,
         _p2: 0,
     };
@@ -2259,7 +2274,7 @@ pub fn silu_f32(
             0,
             pc_bytes,
         );
-        device.cmd_dispatch(one_shot.cmd, (n as u32).div_ceil(64), 1, 1);
+        device.cmd_dispatch(one_shot.cmd, gx, gy, 1);
     }
     one_shot.end()?;
     one_shot.submit()
@@ -2456,17 +2471,26 @@ pub fn bias_add_f32_nhwc(
     one_shot.attach_descriptor_set(backend.pipelines().clone(), desc_set);
     one_shot.begin()?;
 
+    // Adreno A702 / Turnip limits maxComputeWorkGroupCount[0] to 65535.
+    // Our shader uses a 64-wide workgroup, so a single-axis dispatch tops
+    // out at 65535*64 = ~4.2M elements. For larger tensors (any YOLO
+    // conv output) we wrap into 2D: gx covers 65535 workgroups, gy
+    // covers the rest.
+    let total_groups = (n as u64).div_ceil(64);
+    let gx = total_groups.min(65535) as u32;
+    let gy = total_groups.div_ceil(gx as u64) as u32;
+
     #[repr(C)]
     struct PushBiasAdd {
         n: u32,
         c_out: u32,
-        _p0: u32,
+        gx_total: u32,
         _p1: u32,
     }
     let pc = PushBiasAdd {
         n: n as u32,
         c_out: c_out as u32,
-        _p0: 0,
+        gx_total: gx,
         _p1: 0,
     };
     let pc_bytes: &[u8] =
@@ -2490,7 +2514,7 @@ pub fn bias_add_f32_nhwc(
             0,
             pc_bytes,
         );
-        device.cmd_dispatch(one_shot.cmd, (n as u32).div_ceil(64), 1, 1);
+        device.cmd_dispatch(one_shot.cmd, gx, gy, 1);
     }
     one_shot.end()?;
     one_shot.submit()

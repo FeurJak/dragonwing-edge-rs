@@ -23,6 +23,10 @@
 // Dispatch:
 //   gx = ceil(n / 64), gy = gz = 1.
 
+// 2D dispatch (x,y) — flattens to gid = y*gx_total + x. Lets us address
+// up to 65535*65535*64 ~= 268 billion elements without hitting Adreno's
+// per-axis maxComputeWorkGroupCount=65535 limit.
+
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) buffer YBuf {
@@ -36,12 +40,14 @@ layout(set = 0, binding = 1, std430) readonly buffer BiasBuf {
 layout(push_constant) uniform Pc {
     uint n;
     uint c_out;
-    uint _pad0;
+    uint gx_total;  // gx_total * 64 = total invocations addressable from x alone
     uint _pad1;
 } pc;
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    // Flatten 2D grid: gid = (y*gx + x)*64 + local_x  (local_y always 0)
+    uint flat_wg = gl_WorkGroupID.y * pc.gx_total + gl_WorkGroupID.x;
+    uint gid = flat_wg * 64u + gl_LocalInvocationID.x;
     if (gid >= pc.n) {
         return;
     }
