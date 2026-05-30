@@ -53,8 +53,9 @@ use crate::builder::{CompiledOp, OpParams, TensorShape};
 use crate::error::{Error, Result};
 use crate::graph::Graph;
 use dragonwing_core::{Backend, BackendBuffer, BufferKind, Dtype};
-use dragonwing_vulkan::{VulkanBackend, VulkanBuffer};
+use dragonwing_vulkan::{SlabAllocator, VulkanBackend, VulkanBuffer};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Graph runtime that dispatches every op to the Vulkan compute backend.
 ///
@@ -75,6 +76,18 @@ pub struct VulkanGraphRuntime {
     backend: VulkanBackend,
     /// Tensor-name → `VulkanBuffer`. Allocated up-front in `new()`.
     buffers: HashMap<String, VulkanBuffer>,
+    /// Slab allocator backing every tensor buffer. Holds the shared
+    /// `VkDeviceMemory` allocations that buffers reference.
+    ///
+    /// **Drop order matters**: `buffers` must be dropped before `slab`
+    /// so the slab-owned `VkDeviceMemory` outlives every buffer that
+    /// points into it. Rust drops struct fields in declaration order,
+    /// so `buffers` is declared above `slab` deliberately.
+    #[allow(dead_code)]
+    slab: Option<Arc<SlabAllocator>>,
+    /// Stats: number of `vkAllocateMemory` calls issued for this runtime
+    /// (i.e. slab count). Useful for Phase 5 verification.
+    slab_count_at_init: usize,
 }
 
 impl std::fmt::Debug for VulkanGraphRuntime {
@@ -100,23 +113,52 @@ impl VulkanGraphRuntime {
     /// * `Error::Runtime` if an initializer's byte length does not match the
     ///   allocated buffer (typically indicates a build-context bug).
     pub fn new(graph: Graph, backend: VulkanBackend) -> Result<Self> {
+        // Task 008 Phase 5: pack all tensor buffers into a shared slab
+        // allocator. Total memory required is the sum of every tensor's
+        // aligned size, plus per-buffer alignment headroom. We aim for
+        // <10 vkAllocateMemory calls for YOLOv8n (~100 tensors).
+
+        // First pass: compute total bytes to allocate.
+        let total_bytes: usize = graph
+            .shapes
+            .iter()
+            .filter_map(|(_, s)| {
+                let sz = s.size_bytes();
+                if sz == 0 { None } else { Some(sz) }
+            })
+            .map(|sz| (sz + 255) & !255usize) // +alignment slack
+            .sum();
+
+        // Pick a slab size: max(default 16 MiB, total + headroom).
+        // Headroom = 4 MiB to absorb fragmentation; if the model is small
+        // enough we still only allocate one slab.
+        const HEADROOM: usize = 4 * 1024 * 1024;
+        let slab_size = (total_bytes + HEADROOM).max(16 * 1024 * 1024);
+
+        // Discover the right memory type once.
+        let mem_type = backend
+            .find_storage_memory_type()
+            .map_err(|e| Error::Runtime(format!("find_storage_memory_type: {e}")))?;
+        let slab = Arc::new(SlabAllocator::new(
+            backend.context().clone(),
+            mem_type,
+            Some(slab_size),
+        ));
+
         let mut buffers: HashMap<String, VulkanBuffer> = HashMap::new();
 
         for (name, shape) in &graph.shapes {
             let size_bytes = shape.size_bytes();
             if size_bytes == 0 {
-                // Zero-sized tensors (e.g. metadata-only Reshape shape inputs)
-                // — skip allocation. Dispatch code that looks them up will
-                // handle the absence.
                 continue;
             }
-            let buffer = backend
-                .alloc(size_bytes, BufferKind::Storage)
-                .map_err(|e| Error::Runtime(format!("Vulkan alloc {name} failed: {e}")))?;
+            let (buffer, _alloc) = backend
+                .alloc_slab_buffer(&slab, size_bytes)
+                .map_err(|e| Error::Runtime(format!("Vulkan slab alloc {name} failed: {e}")))?;
             buffers.insert(name.clone(), buffer);
         }
 
-        // Upload initializers (weights, biases, etc.)
+        // Upload initializers (weights, biases, etc.).
         for (name, data) in &graph.initializers {
             if let Some(buffer) = buffers.get_mut(name) {
                 if buffer.len_bytes() == data.len() {
@@ -124,17 +166,30 @@ impl VulkanGraphRuntime {
                         .upload(buffer, data)
                         .map_err(|e| Error::Runtime(format!("Vulkan upload {name}: {e}")))?;
                 }
-                // If sizes mismatch, the initializer is likely a shape array
-                // for a metadata-only op (Reshape, Resize, etc.) — silently
-                // skip; the dispatcher will encode the params separately.
             }
         }
+
+        let slab_count_at_init = slab.stats().num_slabs;
 
         Ok(Self {
             graph,
             backend,
             buffers,
+            slab: Some(slab),
+            slab_count_at_init,
         })
+    }
+
+    /// Number of `vkAllocateMemory` calls issued by the slab allocator
+    /// at the time of construction. Phase 5 acceptance criterion:
+    /// `<10` for YOLOv8n.
+    pub fn slab_count(&self) -> usize {
+        self.slab_count_at_init
+    }
+
+    /// Slab allocator statistics (if a slab is in use).
+    pub fn slab_stats(&self) -> Option<dragonwing_vulkan::SlabStats> {
+        self.slab.as_ref().map(|s| s.stats())
     }
 
     /// Input tensor names + shapes (for caller introspection).
@@ -2285,6 +2340,46 @@ mod tests {
             outputs: vec!["z".into()],
             initializers: HashMap::new(),
             dtype: Dtype::F32,
+        }
+    }
+
+    #[test]
+    fn slab_packing_yields_one_allocation_for_small_graph() {
+        let Some(backend) = try_make_backend() else {
+            eprintln!("skipping: no Vulkan device available");
+            return;
+        };
+        // 10 tensors of ~32 bytes each: total <1 MiB → must fit in one slab.
+        let mut shapes = HashMap::new();
+        for i in 0..10 {
+            shapes.insert(
+                format!("t{i}"),
+                TensorShape::new(vec![1, 8], Dtype::F32),
+            );
+        }
+        let graph = Graph {
+            ops: Vec::new(),
+            shapes,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            initializers: HashMap::new(),
+            dtype: Dtype::F32,
+        };
+        let rt = VulkanGraphRuntime::new(graph, backend).expect("new");
+        // Phase 5 acceptance: <10 vkAllocateMemory calls (i.e. <10 slabs).
+        // For a tiny graph this should be exactly 1.
+        let slab_count = rt.slab_count();
+        assert!(
+            slab_count <= 1,
+            "expected ≤1 slab for 10-tensor graph, got {slab_count}"
+        );
+        if let Some(stats) = rt.slab_stats() {
+            assert_eq!(stats.num_slabs, slab_count);
+            assert!(
+                stats.bytes_in_use >= 10 * 256,
+                "bytes_in_use {} too small",
+                stats.bytes_in_use
+            );
         }
     }
 

@@ -150,6 +150,97 @@ impl VulkanBackend {
     pub fn pipelines(&self) -> &Arc<pipeline::PipelineCache> {
         &self.pipelines
     }
+
+    /// Find the preferred memory-type index for storage buffers on the
+    /// current physical device.
+    ///
+    /// Mirrors the selection logic in `VulkanBuffer::new`: prefer
+    /// `HOST_VISIBLE | HOST_COHERENT | DEVICE_LOCAL` (the unified type
+    /// on QRB2210), fall back to `HOST_VISIBLE | HOST_COHERENT`.
+    ///
+    /// `type_filter` should be the `memoryTypeBits` from
+    /// `vkGetBufferMemoryRequirements` for a probe buffer of the same
+    /// usage flags as production buffers. For a typical storage buffer
+    /// this is identical across allocations, so `find_storage_memory_type`
+    /// computes it from a one-byte probe buffer.
+    pub fn find_storage_memory_type(&self) -> Result<u32> {
+        // Create a small probe buffer to discover the memory type filter.
+        let buffer_info = ash::vk::BufferCreateInfo::default()
+            .size(64)
+            .usage(
+                ash::vk::BufferUsageFlags::STORAGE_BUFFER
+                    | ash::vk::BufferUsageFlags::TRANSFER_DST
+                    | ash::vk::BufferUsageFlags::TRANSFER_SRC,
+            )
+            .sharing_mode(ash::vk::SharingMode::EXCLUSIVE);
+        // SAFETY: spec-compliant struct.
+        let probe = unsafe { self.ctx.device().create_buffer(&buffer_info, None) }
+            .map_err(|r| Error::Backend(format!("probe create_buffer: {r:?}")))?;
+        // SAFETY: probe just created.
+        let reqs = unsafe { self.ctx.device().get_buffer_memory_requirements(probe) };
+        // SAFETY: probe owned by us, no work submitted.
+        unsafe { self.ctx.device().destroy_buffer(probe, None) };
+
+        memory::find_memory_type(
+            self.ctx.instance(),
+            self.ctx.physical_device(),
+            reqs.memory_type_bits,
+            ash::vk::MemoryPropertyFlags::HOST_VISIBLE
+                | ash::vk::MemoryPropertyFlags::HOST_COHERENT
+                | ash::vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .or_else(|| {
+            memory::find_memory_type(
+                self.ctx.instance(),
+                self.ctx.physical_device(),
+                reqs.memory_type_bits,
+                ash::vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | ash::vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+        })
+        .ok_or_else(|| Error::Backend("no suitable storage memory type".into()))
+    }
+
+    /// Allocate a `VulkanBuffer` of `len_bytes` from a [`SlabAllocator`].
+    ///
+    /// The returned buffer holds a sub-range of a slab's `VkDeviceMemory`.
+    /// It must be dropped **before** the `SlabAllocator` (typically by
+    /// arranging both inside the same owning struct).
+    ///
+    /// Caller is responsible for tracking the returned `SlabAllocation`
+    /// alongside the buffer if it later wants to call
+    /// [`SlabAllocator::free`] explicitly. For graph-runtime workloads
+    /// where allocations live as long as the runtime, freeing happens
+    /// implicitly when the slab is dropped.
+    pub fn alloc_slab_buffer(
+        &self,
+        slab: &SlabAllocator,
+        len_bytes: usize,
+    ) -> Result<(VulkanBuffer, SlabAllocation)> {
+        if len_bytes == 0 {
+            return Err(Error::Backend(
+                "alloc_slab_buffer: zero-length buffers are not supported".into(),
+            ));
+        }
+        let allocation = slab.alloc(len_bytes)?;
+        let memory_handle = slab.memory(&allocation)?;
+        let mapped = slab
+            .mapped_ptr(&allocation)
+            .ok_or_else(|| Error::Backend("alloc_slab_buffer: slab memory not host-visible".into()))?;
+        // Use the caller's `len_bytes` (the logical size) for the
+        // VkBuffer; the slab may have rounded up to MIN_ALIGNMENT (256 B)
+        // and binding a larger VkBuffer than requested would make
+        // `len_bytes()` return the wrong value for downstream size checks.
+        let buffer = VulkanBuffer::from_slab(
+            self.ctx.clone(),
+            len_bytes,
+            allocation.size(),
+            memory_handle,
+            allocation.offset(),
+            mapped,
+        )?;
+        Ok((buffer, allocation))
+    }
 }
 
 impl Backend for VulkanBackend {
