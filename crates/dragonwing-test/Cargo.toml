@@ -26,3 +26,13 @@ path = "src/bin/parity_test.rs"
 [[bin]]
 name = "device-benchmark"
 path = "src/bin/device_benchmark.rs"
+
+# Task 008 Phase 6 — YOLOv8 ONNX inspector (host-side).
+[[bin]]
+name = "yolo-inspect"
+path = "src/bin/yolo_inspect.rs"
+
+# Task 008 Phase 6 — YOLOv8 end-to-end benchmark on Vulkan.
+[[bin]]
+name = "yolo-benchmark"
+path = "src/bin/yolo_benchmark.rs"
