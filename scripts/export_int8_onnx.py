@@ -242,8 +242,57 @@ def quantize_qdq(
     )
 
     if verbose:
-        print(f"[export_int8]   done", flush=True)
+        print(f"[export_int8]   done (pre-simplify)", flush=True)
     return output_path
+
+
+def simplify_quantized(onnx_path: Path, verbose: bool) -> None:
+    """Run `onnxsim.simplify` on a QDQ-quantized ONNX model in place.
+
+    ORT's static quantizer inserts `Shape → Gather → Mul → Slice` chains
+    in YOLO detection heads with constant arithmetic that the dragonwing
+    `SliceBuilder` cannot resolve (it requires `starts/ends` to be true
+    constants). `onnxsim` folds those constant chains and lets the
+    detection head compile cleanly.
+
+    Skipped quietly if `onnxsim` is not installed.
+    """
+    try:
+        import onnx
+        from onnxsim import simplify
+    except ImportError:
+        if verbose:
+            print(
+                "[export_int8] onnxsim not installed; skipping post-quant simplify",
+                flush=True,
+            )
+        return
+
+    if verbose:
+        print(f"[export_int8] stage 3: onnxsim post-quant simplify", flush=True)
+    model = onnx.load(str(onnx_path))
+    n_before = len(model.graph.node)
+    try:
+        simplified, ok = simplify(model)
+    except Exception as e:
+        print(
+            f"[export_int8] WARNING: onnxsim failed ({e}); keeping unsimplified model",
+            file=sys.stderr,
+        )
+        return
+    if not ok:
+        print(
+            "[export_int8] WARNING: onnxsim returned ok=False; keeping unsimplified model",
+            file=sys.stderr,
+        )
+        return
+    onnx.save(simplified, str(onnx_path))
+    n_after = len(simplified.graph.node)
+    if verbose:
+        print(
+            f"[export_int8]   simplified {n_before} → {n_after} nodes",
+            flush=True,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -377,6 +426,11 @@ def main() -> None:
         calib_frac=args.calib_frac,
         verbose=args.verbose,
     )
+
+    # Stage 3: post-quant simplify (folds the constant chains ORT
+    # inserts in YOLO detection heads). Skipped if onnxsim is missing.
+    if not args.no_simplify:
+        simplify_quantized(out_path, verbose=args.verbose)
 
     # Optional cleanup of the intermediate F32 ONNX.
     if not args.keep_f32 and f32_path != out_path:
