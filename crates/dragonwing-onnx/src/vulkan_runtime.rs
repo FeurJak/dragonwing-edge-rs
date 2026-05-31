@@ -53,8 +53,9 @@ use crate::builder::{CompiledOp, OpParams, TensorShape};
 use crate::error::{Error, Result};
 use crate::graph::Graph;
 use dragonwing_core::{Backend, BackendBuffer, BufferKind, Dtype};
-use dragonwing_vulkan::{VulkanBackend, VulkanBuffer};
+use dragonwing_vulkan::{SlabAllocator, VulkanBackend, VulkanBuffer};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Graph runtime that dispatches every op to the Vulkan compute backend.
 ///
@@ -75,6 +76,18 @@ pub struct VulkanGraphRuntime {
     backend: VulkanBackend,
     /// Tensor-name → `VulkanBuffer`. Allocated up-front in `new()`.
     buffers: HashMap<String, VulkanBuffer>,
+    /// Slab allocator backing every tensor buffer. Holds the shared
+    /// `VkDeviceMemory` allocations that buffers reference.
+    ///
+    /// **Drop order matters**: `buffers` must be dropped before `slab`
+    /// so the slab-owned `VkDeviceMemory` outlives every buffer that
+    /// points into it. Rust drops struct fields in declaration order,
+    /// so `buffers` is declared above `slab` deliberately.
+    #[allow(dead_code)]
+    slab: Option<Arc<SlabAllocator>>,
+    /// Stats: number of `vkAllocateMemory` calls issued for this runtime
+    /// (i.e. slab count). Useful for Phase 5 verification.
+    slab_count_at_init: usize,
 }
 
 impl std::fmt::Debug for VulkanGraphRuntime {
@@ -100,23 +113,69 @@ impl VulkanGraphRuntime {
     /// * `Error::Runtime` if an initializer's byte length does not match the
     ///   allocated buffer (typically indicates a build-context bug).
     pub fn new(graph: Graph, backend: VulkanBackend) -> Result<Self> {
+        // Task 008 Phase 5: pack all tensor buffers into a shared slab
+        // allocator. Total memory required is the sum of every tensor's
+        // aligned size, plus per-buffer alignment headroom. We aim for
+        // <10 vkAllocateMemory calls for YOLOv8n (~100 tensors).
+        //
+        // Disable the slab path by setting `DRAGONWING_DISABLE_SLAB=1`.
+        // The per-buffer `vkAllocateMemory` path is slower at init but
+        // is sometimes useful for isolating GPU-side faults that are
+        // suspected to be slab-binding bugs.
+        let disable_slab = std::env::var("DRAGONWING_DISABLE_SLAB").is_ok();
+
+        // First pass: compute total bytes to allocate.
+        let total_bytes: usize = graph
+            .shapes
+            .iter()
+            .filter_map(|(_, s)| {
+                let sz = s.size_bytes();
+                if sz == 0 { None } else { Some(sz) }
+            })
+            .map(|sz| (sz + 255) & !255usize) // +alignment slack
+            .sum();
+
+        // Pick a slab size: max(default 16 MiB, total + headroom).
+        // Headroom = 4 MiB to absorb fragmentation; if the model is small
+        // enough we still only allocate one slab.
+        const HEADROOM: usize = 4 * 1024 * 1024;
+        let slab_size = (total_bytes + HEADROOM).max(16 * 1024 * 1024);
+
+        let slab = if disable_slab {
+            None
+        } else {
+            // Discover the right memory type once.
+            let mem_type = backend
+                .find_storage_memory_type()
+                .map_err(|e| Error::Runtime(format!("find_storage_memory_type: {e}")))?;
+            Some(Arc::new(SlabAllocator::new(
+                backend.context().clone(),
+                mem_type,
+                Some(slab_size),
+            )))
+        };
+
         let mut buffers: HashMap<String, VulkanBuffer> = HashMap::new();
 
         for (name, shape) in &graph.shapes {
             let size_bytes = shape.size_bytes();
             if size_bytes == 0 {
-                // Zero-sized tensors (e.g. metadata-only Reshape shape inputs)
-                // — skip allocation. Dispatch code that looks them up will
-                // handle the absence.
                 continue;
             }
-            let buffer = backend
-                .alloc(size_bytes, BufferKind::Storage)
-                .map_err(|e| Error::Runtime(format!("Vulkan alloc {name} failed: {e}")))?;
+            let buffer = if let Some(slab_ref) = &slab {
+                let (buffer, _alloc) = backend
+                    .alloc_slab_buffer(slab_ref, size_bytes)
+                    .map_err(|e| Error::Runtime(format!("Vulkan slab alloc {name} failed: {e}")))?;
+                buffer
+            } else {
+                backend
+                    .alloc(size_bytes, BufferKind::Storage)
+                    .map_err(|e| Error::Runtime(format!("Vulkan alloc {name} failed: {e}")))?
+            };
             buffers.insert(name.clone(), buffer);
         }
 
-        // Upload initializers (weights, biases, etc.)
+        // Upload initializers (weights, biases, etc.).
         for (name, data) in &graph.initializers {
             if let Some(buffer) = buffers.get_mut(name) {
                 if buffer.len_bytes() == data.len() {
@@ -124,17 +183,30 @@ impl VulkanGraphRuntime {
                         .upload(buffer, data)
                         .map_err(|e| Error::Runtime(format!("Vulkan upload {name}: {e}")))?;
                 }
-                // If sizes mismatch, the initializer is likely a shape array
-                // for a metadata-only op (Reshape, Resize, etc.) — silently
-                // skip; the dispatcher will encode the params separately.
             }
         }
+
+        let slab_count_at_init = slab.as_ref().map(|s| s.stats().num_slabs).unwrap_or(0);
 
         Ok(Self {
             graph,
             backend,
             buffers,
+            slab,
+            slab_count_at_init,
         })
+    }
+
+    /// Number of `vkAllocateMemory` calls issued by the slab allocator
+    /// at the time of construction. Phase 5 acceptance criterion:
+    /// `<10` for YOLOv8n.
+    pub fn slab_count(&self) -> usize {
+        self.slab_count_at_init
+    }
+
+    /// Slab allocator statistics (if a slab is in use).
+    pub fn slab_stats(&self) -> Option<dragonwing_vulkan::SlabStats> {
+        self.slab.as_ref().map(|s| s.stats())
     }
 
     /// Input tensor names + shapes (for caller introspection).
@@ -269,23 +341,151 @@ impl VulkanGraphRuntime {
 
     /// Execute all ops in graph order.
     ///
-    /// Each op records and submits its own command buffer (the existing
-    /// `dragonwing_vulkan::ops::*` pattern); barriers between dependent ops
-    /// are not yet inserted because every submit currently waits on the
-    /// previous via the timeline semaphore. Phase 6 will optimise this by
-    /// batching into a single command buffer with explicit
-    /// `vkCmdPipelineBarrier` between dependent ops.
+    /// Task 008 Phase 4: Ops with native Vulkan shaders are recorded into
+    /// a **single command buffer** via [`dragonwing_vulkan::OpsRecorder`],
+    /// with `cmd_pipeline_barrier` inserted between dependent ops. The
+    /// batch is submitted once, drastically reducing per-op
+    /// `vkQueueSubmit` overhead.
+    ///
+    /// Task 008 Phase 6: Ops that don't have Vulkan shaders yet (Sub,
+    /// Div, Concat, Resize, Split, Transpose, Slice) **flush** the
+    /// current recorder, run a CPU fallback (`download → compute →
+    /// upload`), and then a new recorder is started for the next run of
+    /// GPU ops. This lets the full YOLOv8 graph run end-to-end without
+    /// blocking on shader implementation of the layout-shuffling ops.
+    ///
+    /// The previous strictly-per-op submit path remains available as
+    /// [`Self::run_unbatched`].
     pub fn run(&mut self) -> Result<()> {
         let ops: Vec<CompiledOp> = self.graph.ops.clone();
-        for op in &ops {
-            self.dispatch_op(op)?;
+        let mut recorder_opt: Option<dragonwing_vulkan::OpsRecorder> = None;
+
+        for (i, op) in ops.iter().enumerate() {
+            let cpu_fallback = matches!(
+                &op.params,
+                OpParams::Sub
+                    | OpParams::Div
+                    | OpParams::Concat { .. }
+                    | OpParams::Resize { .. }
+                    | OpParams::Split { .. }
+                    | OpParams::Transpose { .. }
+                    | OpParams::Slice { .. }
+            );
+
+            if cpu_fallback {
+                // Flush any pending GPU work first so the CPU dispatch
+                // reads coherent data.
+                if let Some(rec) = recorder_opt.take() {
+                    rec.finish_and_submit()
+                        .map_err(|e| Error::Runtime(format!("recorder flush: {e}")))?;
+                    self.backend
+                        .synchronize()
+                        .map_err(|e| Error::Runtime(format!("flush synchronize: {e}")))?;
+                }
+                // Dispatch on host. The CPU fallback paths
+                // (dispatch_cpu_*) themselves take care of download +
+                // upload around the actual compute.
+                self.dispatch_op(op)?;
+                continue;
+            }
+
+            // GPU op — open a recorder lazily on demand.
+            let rec = match recorder_opt.as_mut() {
+                Some(r) => r,
+                None => {
+                    let r = dragonwing_vulkan::OpsRecorder::begin(&self.backend)
+                        .map_err(|e| Error::Runtime(format!("recorder begin: {e}")))?;
+                    recorder_opt = Some(r);
+                    recorder_opt.as_mut().unwrap()
+                }
+            };
+
+            if i > 0 && Self::needs_barrier(&ops, i) {
+                rec.record_memory_barrier();
+            }
+            self.record_op(rec, op)?;
         }
-        // Ensure all submitted work has finished before returning so the next
-        // get_output_* sees coherent data.
+
+        // Submit anything left in the current recorder.
+        if let Some(rec) = recorder_opt.take() {
+            rec.finish_and_submit()
+                .map_err(|e| Error::Runtime(format!("recorder submit: {e}")))?;
+        }
+
         self.backend
             .synchronize()
             .map_err(|e| Error::Runtime(format!("synchronize: {e}")))?;
         Ok(())
+    }
+
+    /// Legacy per-op submit path — one `OneShot` per op. Used for tests
+    /// that exercise individual ops via `dispatch_op()`.
+    pub fn run_unbatched(&mut self) -> Result<()> {
+        let ops: Vec<CompiledOp> = self.graph.ops.clone();
+        let trace = std::env::var("DRAGONWING_TRACE").is_ok();
+        for (i, op) in ops.iter().enumerate() {
+            if trace {
+                let in_shapes: Vec<String> = op
+                    .inputs
+                    .iter()
+                    .map(|n| {
+                        self.graph
+                            .shapes
+                            .get(n)
+                            .map(|s| format!("{n}{:?}", s.dims))
+                            .unwrap_or_else(|| format!("{n}(?)"))
+                    })
+                    .collect();
+                let out_shapes: Vec<String> = op
+                    .outputs
+                    .iter()
+                    .map(|n| {
+                        self.graph
+                            .shapes
+                            .get(n)
+                            .map(|s| format!("{n}{:?}", s.dims))
+                            .unwrap_or_else(|| format!("{n}(?)"))
+                    })
+                    .collect();
+                eprintln!(
+                    "[op {i:3}] {} ({}) in={:?} out={:?}",
+                    op.name, op.op_type, in_shapes, out_shapes
+                );
+            }
+            self.dispatch_op(op).map_err(|e| {
+                Error::Runtime(format!(
+                    "op[{i}] {} ({}) failed: {e}",
+                    op.name, op.op_type
+                ))
+            })?;
+            if trace {
+                self.backend.synchronize().ok();
+            }
+        }
+        self.backend
+            .synchronize()
+            .map_err(|e| Error::Runtime(format!("synchronize: {e}")))?;
+        Ok(())
+    }
+
+    /// Decide if a barrier is needed before op `idx`.
+    ///
+    /// We insert a barrier when any of `ops[idx].inputs` was written by
+    /// `ops[idx - 1]` (the immediately preceding op). This catches the
+    /// common case where the runtime emits a strictly sequential chain
+    /// `A → B → C` with no parallelism between dispatches.
+    ///
+    /// Two simplifying assumptions:
+    /// 1. **Single-producer ordering.** Graph ops appear in topological
+    ///    order; producers always run before consumers. So we only need
+    ///    to check the immediate predecessor.
+    /// 2. **Conservative over-barrier.** When in doubt we insert a
+    ///    barrier — it's cheaper than missing one (which causes silent
+    ///    data corruption on Turnip / Adreno A702).
+    fn needs_barrier(ops: &[CompiledOp], idx: usize) -> bool {
+        let prev = &ops[idx - 1];
+        let cur = &ops[idx];
+        cur.inputs.iter().any(|inp| prev.outputs.contains(inp))
     }
 
     /// Get two buffers (one shared, one mut) from the `buffers` map without
@@ -392,7 +592,128 @@ impl VulkanGraphRuntime {
             OpParams::Quantize { scale } => self.dispatch_quantize(op, *scale),
             OpParams::Dequantize { scale } => self.dispatch_dequantize(op, *scale),
 
-            // ----- ops without Vulkan shaders yet (CPU fallback later) ---
+            // ----- Fused INT8 ops (Phase 1 of Task 008) ------------------
+            OpParams::Conv2dRequantReluI8Nhwc {
+                kernel_shape,
+                strides,
+                pads,
+                group,
+                requant_scale,
+                has_relu,
+                ..
+            } => self.dispatch_conv2d_requant_relu_i8(
+                op,
+                *kernel_shape,
+                *strides,
+                *pads,
+                *group,
+                *requant_scale,
+                *has_relu,
+            ),
+
+            // ----- ops without Vulkan shaders yet — CPU fallback ---------
+            // We download inputs to host, run a CPU op, and upload the
+            // result. This kills batched-recorder performance for the
+            // affected ops but lets the full YOLO graph run end-to-end.
+            // Task 009 should add native Vulkan shaders for these.
+            OpParams::Sub => self.dispatch_cpu_sub(op),
+            OpParams::Div => self.dispatch_cpu_div(op),
+            OpParams::Concat { axis } => self.dispatch_cpu_concat(op, *axis),
+            OpParams::Resize { out_h, out_w, mode } => {
+                self.dispatch_cpu_resize(op, *out_h, *out_w, mode)
+            }
+            OpParams::Split { axis, split_sizes } => {
+                self.dispatch_cpu_split(op, *axis, split_sizes)
+            }
+            OpParams::Transpose { perm } => self.dispatch_cpu_transpose(op, perm),
+            OpParams::Slice {
+                starts,
+                ends,
+                axes,
+                steps,
+            } => self.dispatch_cpu_slice(op, starts, ends, axes, steps),
+            OpParams::GlobalAvgPool | OpParams::AvgPool { .. } => Err(Error::Runtime(format!(
+                "op {:?} not yet supported by VulkanGraphRuntime",
+                op.op_type
+            ))),
+        }
+    }
+
+    // =========================================================================
+    // Task 008 Phase 4 — record_op: parallel to dispatch_op, but records into
+    // a shared OpsRecorder instead of submitting per op. Used by the new
+    // run() to batch the whole graph into a single command buffer.
+    //
+    // Shape resolution + buffer lookup logic is shared with dispatch_op via
+    // helpers; only the final "send dispatch" call differs.
+    // =========================================================================
+
+    fn record_op(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+    ) -> Result<()> {
+        match &op.params {
+            OpParams::None => match op.op_type.as_str() {
+                "Flatten" | "Reshape" => self.record_reshape(rec, op),
+                "Relu" => self.record_relu(rec, op),
+                "SiLU" => self.record_silu(rec, op),
+                _ => Ok(()),
+            },
+            OpParams::Reshape { .. } => self.record_reshape(rec, op),
+            OpParams::Add => self.record_add(rec, op),
+            OpParams::Mul => self.record_mul(rec, op),
+            OpParams::Sigmoid => self.record_sigmoid(rec, op),
+            OpParams::Clip { min, max } => {
+                if *min == 0.0 && max.is_infinite() {
+                    self.record_relu(rec, op)
+                } else {
+                    Err(Error::Runtime(
+                        "vk record_clip: general clip not supported".into(),
+                    ))
+                }
+            }
+            OpParams::Gemm {
+                trans_a, trans_b, ..
+            } => self.record_gemm(rec, op, *trans_a, *trans_b),
+            OpParams::Conv2d {
+                kernel_shape,
+                strides,
+                pads,
+                group,
+                ..
+            } => self.record_conv2d(rec, op, *kernel_shape, *strides, *pads, *group),
+            OpParams::MaxPool {
+                kernel_shape,
+                strides,
+                ..
+            } => self.record_maxpool(rec, op, *kernel_shape, *strides),
+            OpParams::Softmax { axis } => self.record_softmax(rec, op, *axis),
+            OpParams::Requantize { scale } => self.record_requantize(rec, op, *scale),
+            OpParams::AddQuantized {
+                scale_a_over_out,
+                scale_b_over_out,
+            } => self.record_add_quantized(rec, op, *scale_a_over_out, *scale_b_over_out),
+            OpParams::Quantize { scale } => self.record_quantize(rec, op, *scale),
+            OpParams::Dequantize { scale } => self.record_dequantize(rec, op, *scale),
+            OpParams::Conv2dRequantReluI8Nhwc {
+                kernel_shape,
+                strides,
+                pads,
+                group,
+                requant_scale,
+                has_relu,
+                ..
+            } => self.record_conv2d_requant_relu_i8(
+                rec,
+                op,
+                *kernel_shape,
+                *strides,
+                *pads,
+                *group,
+                *requant_scale,
+                *has_relu,
+            ),
             OpParams::Sub
             | OpParams::Div
             | OpParams::GlobalAvgPool
@@ -402,10 +723,485 @@ impl VulkanGraphRuntime {
             | OpParams::Split { .. }
             | OpParams::Transpose { .. }
             | OpParams::Slice { .. } => Err(Error::Runtime(format!(
-                "op {:?} not yet supported by VulkanGraphRuntime",
+                "op {:?} not yet supported by VulkanGraphRuntime (record path)",
                 op.op_type
             ))),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // record_* implementations — thin wrappers that mirror dispatch_* but
+    // call rec.record_* instead of dragonwing_vulkan::ops::*.
+    // -------------------------------------------------------------------------
+
+    fn record_reshape(
+        &mut self,
+        _rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+    ) -> Result<()> {
+        // Reshape is a no-op when in==out names. When they differ, copy
+        // via the GPU. For now, mirror the dispatch path's host bounce.
+        // (TODO: switch to vkCmdCopyBuffer once we have a record_copy_buffer.)
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Ok(());
+        }
+        if op.inputs[0] == op.outputs[0] {
+            return Ok(());
+        }
+        // Host-side bounce: this forces a partial sync (download requires the
+        // batch be empty). To avoid breaking the batched recorder semantics,
+        // we leave Reshape unsupported in the batched path for now. Real-world
+        // ONNX models typically have Reshape only at the boundaries where
+        // shape-changes happen between inference stages.
+        Err(Error::Runtime(
+            "record_reshape with input != output not supported in batched run; \
+             use run_unbatched, or rewrite the graph to alias the reshape"
+                .into(),
+        ))
+    }
+
+    fn record_relu(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+    ) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_relu: missing input/output".into()));
+        }
+        if op.inputs[0] != op.outputs[0] {
+            return Err(Error::Runtime(
+                "record_relu: out-of-place not supported in batched path".into(),
+            ));
+        }
+        let name = op.inputs[0].clone();
+        let buf = self
+            .buffers
+            .get_mut(&name)
+            .ok_or_else(|| Error::Runtime(format!("buffer not found: {name}")))?;
+        rec.record_relu_f32(buf)
+            .map_err(|e| Error::Runtime(format!("vk record relu_f32: {e}")))
+    }
+
+    fn record_add(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+    ) -> Result<()> {
+        if op.inputs.len() < 2 || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_add: needs 2 inputs and 1 output".into()));
+        }
+        let (a, b, y) = Self::get_three_buffers(
+            &mut self.buffers,
+            &op.inputs[0],
+            &op.inputs[1],
+            &op.outputs[0],
+        )?;
+        rec.record_add_f32(a, b, y)
+            .map_err(|e| Error::Runtime(format!("vk record add_f32: {e}")))
+    }
+
+    fn record_mul(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+    ) -> Result<()> {
+        if op.inputs.len() < 2 || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_mul: needs 2 inputs and 1 output".into()));
+        }
+        let (a, b, y) = Self::get_three_buffers(
+            &mut self.buffers,
+            &op.inputs[0],
+            &op.inputs[1],
+            &op.outputs[0],
+        )?;
+        rec.record_mul_f32(a, b, y)
+            .map_err(|e| Error::Runtime(format!("vk record mul_f32: {e}")))
+    }
+
+    fn record_sigmoid(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+    ) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_sigmoid: missing input/output".into()));
+        }
+        if op.inputs[0] == op.outputs[0] {
+            return Err(Error::Runtime(
+                "record_sigmoid: in-place not supported".into(),
+            ));
+        }
+        let (input, output) =
+            Self::get_two_buffers(&mut self.buffers, &op.inputs[0], &op.outputs[0])?;
+        rec.record_sigmoid_f32(input, output)
+            .map_err(|e| Error::Runtime(format!("vk record sigmoid_f32: {e}")))
+    }
+
+    fn record_silu(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+    ) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_silu: missing input/output".into()));
+        }
+        if op.inputs[0] == op.outputs[0] {
+            return Err(Error::Runtime("record_silu: in-place not supported".into()));
+        }
+        let (input, output) =
+            Self::get_two_buffers(&mut self.buffers, &op.inputs[0], &op.outputs[0])?;
+        rec.record_silu_f32(input, output)
+            .map_err(|e| Error::Runtime(format!("vk record silu_f32: {e}")))
+    }
+
+    fn record_gemm(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> Result<()> {
+        if op.inputs.len() < 2 || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_gemm: needs ≥2 inputs and 1 output".into()));
+        }
+        let a_shape = self
+            .graph
+            .shapes
+            .get(&op.inputs[0])
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {}", op.inputs[0])))?;
+        let b_shape = self
+            .graph
+            .shapes
+            .get(&op.inputs[1])
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {}", op.inputs[1])))?;
+        if a_shape.dims.len() != 2 || b_shape.dims.len() != 2 {
+            return Err(Error::Runtime("record_gemm: inputs must be 2D".into()));
+        }
+        let m = if trans_a { a_shape.dims[1] } else { a_shape.dims[0] };
+        let k = if trans_a { a_shape.dims[0] } else { a_shape.dims[1] };
+        let n = if trans_b { b_shape.dims[0] } else { b_shape.dims[1] };
+        if trans_a || trans_b {
+            return Err(Error::Runtime(format!(
+                "record_gemm: trans_a/trans_b not supported (call fold_gemm_transpose first); \
+                 trans_a={trans_a}, trans_b={trans_b}"
+            )));
+        }
+        let a_name = op.inputs[0].clone();
+        let b_name = op.inputs[1].clone();
+        let c_name = op.outputs[0].clone();
+        let bias_name: Option<String> = if op.inputs.len() > 2 && !op.inputs[2].is_empty() {
+            Some(op.inputs[2].clone())
+        } else {
+            None
+        };
+
+        let (a, b, c) =
+            Self::get_three_buffers(&mut self.buffers, &a_name, &b_name, &c_name)?;
+        rec.record_gemm_f32(a, b, c, m, n, k)
+            .map_err(|e| Error::Runtime(format!("vk record gemm_f32: {e}")))?;
+
+        if let Some(bias_name) = bias_name {
+            let bias_n = self
+                .buffers
+                .get(&bias_name)
+                .map(|b| b.len_bytes() / 4)
+                .unwrap_or(0);
+            if bias_n == n {
+                // Bias must read the just-written gemm output, so insert a barrier.
+                rec.record_memory_barrier();
+                let (bias, c) = Self::get_two_buffers(&mut self.buffers, &bias_name, &c_name)?;
+                rec.record_bias_add_f32_nhwc(c, bias, n)
+                    .map_err(|e| Error::Runtime(format!("vk record gemm bias_add: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_conv2d(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+        kernel_shape: [usize; 2],
+        strides: [usize; 2],
+        pads: [usize; 4],
+        group: usize,
+    ) -> Result<()> {
+        if op.inputs.len() < 2 || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_conv2d: needs ≥2 inputs and 1 output".into()));
+        }
+        let in_shape = self
+            .graph
+            .shapes
+            .get(&op.inputs[0])
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {}", op.inputs[0])))?;
+        let out_shape = self
+            .graph
+            .shapes
+            .get(&op.outputs[0])
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {}", op.outputs[0])))?;
+        if in_shape.dims.len() != 4 {
+            return Err(Error::Runtime("record_conv2d input must be 4D NHWC".into()));
+        }
+        let n = in_shape.dims[0];
+        let h_in = in_shape.dims[1];
+        let w_in = in_shape.dims[2];
+        let c_in = in_shape.dims[3];
+        let c_out = out_shape.dims[3];
+        if group != 1 {
+            return Err(Error::Runtime(format!(
+                "record_conv2d: group={group} not supported"
+            )));
+        }
+        let bias_name: Option<String> = if op.inputs.len() > 2 && !op.inputs[2].is_empty() {
+            Some(op.inputs[2].clone())
+        } else {
+            None
+        };
+        let in_name = op.inputs[0].clone();
+        let w_name = op.inputs[1].clone();
+        let out_name = op.outputs[0].clone();
+        let (input, kernel, output) =
+            Self::get_three_buffers(&mut self.buffers, &in_name, &w_name, &out_name)?;
+        rec.record_conv2d_f32_nhwc(
+            input, kernel, output, n, h_in, w_in, c_in, c_out, kernel_shape[0], kernel_shape[1],
+            strides[0], strides[1], pads[0], pads[1],
+        )
+        .map_err(|e| Error::Runtime(format!("vk record conv2d_f32_nhwc: {e}")))?;
+
+        if let Some(bias_name) = bias_name {
+            // See dispatch_conv2d for the bias-shape sanity check rationale.
+            let bias_n = self
+                .buffers
+                .get(&bias_name)
+                .map(|b| b.len_bytes() / 4)
+                .unwrap_or(0);
+            if bias_n == c_out {
+                rec.record_memory_barrier();
+                let (bias, output) =
+                    Self::get_two_buffers(&mut self.buffers, &bias_name, &out_name)?;
+                rec.record_bias_add_f32_nhwc(output, bias, c_out)
+                    .map_err(|e| Error::Runtime(format!("vk record conv2d bias_add: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_maxpool(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+        kernel_shape: [usize; 2],
+        strides: [usize; 2],
+    ) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_maxpool: missing input/output".into()));
+        }
+        let in_shape = self
+            .graph
+            .shapes
+            .get(&op.inputs[0])
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {}", op.inputs[0])))?;
+        if in_shape.dims.len() != 4 {
+            return Err(Error::Runtime("record_maxpool input must be 4D NHWC".into()));
+        }
+        let n = in_shape.dims[0];
+        let h_in = in_shape.dims[1];
+        let w_in = in_shape.dims[2];
+        let c = in_shape.dims[3];
+        let in_name = op.inputs[0].clone();
+        let out_name = op.outputs[0].clone();
+        let (input, output) = Self::get_two_buffers(&mut self.buffers, &in_name, &out_name)?;
+        rec.record_maxpool2d_f32(
+            input,
+            output,
+            n,
+            h_in,
+            w_in,
+            c,
+            kernel_shape[0],
+            kernel_shape[1],
+            strides[0],
+            strides[1],
+        )
+        .map_err(|e| Error::Runtime(format!("vk record maxpool2d_f32: {e}")))
+    }
+
+    fn record_softmax(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+        _axis: i64,
+    ) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_softmax: missing input/output".into()));
+        }
+        let in_name = op.inputs[0].clone();
+        let out_name = op.outputs[0].clone();
+        if in_name == out_name {
+            return Err(Error::Runtime("record_softmax: in-place not supported".into()));
+        }
+        let in_shape = self
+            .graph
+            .shapes
+            .get(&in_name)
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {in_name}")))?;
+        let last = *in_shape.dims.last().unwrap_or(&1);
+        let rows = in_shape.numel() / last;
+        let (input, output) = Self::get_two_buffers(&mut self.buffers, &in_name, &out_name)?;
+        rec.record_softmax_f32(input, output, rows, last)
+            .map_err(|e| Error::Runtime(format!("vk record softmax_f32: {e}")))
+    }
+
+    fn record_requantize(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+        scale: f32,
+    ) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_requantize: missing input/output".into()));
+        }
+        let in_name = op.inputs[0].clone();
+        let out_name = op.outputs[0].clone();
+        if in_name == out_name {
+            return Err(Error::Runtime(
+                "record_requantize: in-place not supported".into(),
+            ));
+        }
+        let (input, output) = Self::get_two_buffers(&mut self.buffers, &in_name, &out_name)?;
+        rec.record_requantize_i32_to_i8_packed(input, output, scale)
+            .map_err(|e| Error::Runtime(format!("vk record requantize: {e}")))
+    }
+
+    fn record_add_quantized(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+        scale_a_over_out: f32,
+        scale_b_over_out: f32,
+    ) -> Result<()> {
+        if op.inputs.len() < 2 || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_add_q: needs 2 inputs + 1 output".into()));
+        }
+        let (a, b, y) = Self::get_three_buffers(
+            &mut self.buffers,
+            &op.inputs[0],
+            &op.inputs[1],
+            &op.outputs[0],
+        )?;
+        rec.record_add_i8_packed(a, b, y, scale_a_over_out, scale_b_over_out)
+            .map_err(|e| Error::Runtime(format!("vk record add_i8: {e}")))
+    }
+
+    fn record_quantize(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+        scale: f32,
+    ) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_quantize: missing input/output".into()));
+        }
+        let in_name = op.inputs[0].clone();
+        let out_name = op.outputs[0].clone();
+        if in_name == out_name {
+            return Err(Error::Runtime("record_quantize: in-place not supported".into()));
+        }
+        let (input, output) = Self::get_two_buffers(&mut self.buffers, &in_name, &out_name)?;
+        rec.record_quantize_f32_to_i8_packed(input, output, scale)
+            .map_err(|e| Error::Runtime(format!("vk record quantize: {e}")))
+    }
+
+    fn record_dequantize(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+        scale: f32,
+    ) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("record_dequantize: missing input/output".into()));
+        }
+        let in_name = op.inputs[0].clone();
+        let out_name = op.outputs[0].clone();
+        if in_name == out_name {
+            return Err(Error::Runtime("record_dequantize: in-place not supported".into()));
+        }
+        let (input, output) = Self::get_two_buffers(&mut self.buffers, &in_name, &out_name)?;
+        rec.record_dequantize_i8_packed_to_f32(input, output, scale)
+            .map_err(|e| Error::Runtime(format!("vk record dequantize: {e}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_conv2d_requant_relu_i8(
+        &mut self,
+        rec: &mut dragonwing_vulkan::OpsRecorder,
+        op: &CompiledOp,
+        kernel_shape: [usize; 2],
+        strides: [usize; 2],
+        pads: [usize; 4],
+        group: usize,
+        requant_scale: f32,
+        has_relu: bool,
+    ) -> Result<()> {
+        if op.inputs.len() < 2 || op.outputs.is_empty() {
+            return Err(Error::Runtime(
+                "record_conv2d_requant_relu_i8: needs ≥2 inputs and 1 output".into(),
+            ));
+        }
+        if group != 1 {
+            return Err(Error::Runtime(format!(
+                "record_conv2d_requant_relu_i8: group={group} not supported"
+            )));
+        }
+        if op.inputs.len() > 2 && !op.inputs[2].is_empty() {
+            return Err(Error::Runtime(
+                "record_conv2d_requant_relu_i8: bias must be folded at compile time".into(),
+            ));
+        }
+        let in_shape = self
+            .graph
+            .shapes
+            .get(&op.inputs[0])
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {}", op.inputs[0])))?;
+        let out_shape = self
+            .graph
+            .shapes
+            .get(&op.outputs[0])
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {}", op.outputs[0])))?;
+        if in_shape.dims.len() != 4 || out_shape.dims.len() != 4 {
+            return Err(Error::Runtime(
+                "record_conv2d_requant_relu_i8: shapes must be 4D NHWC".into(),
+            ));
+        }
+        let n = in_shape.dims[0];
+        let h_in = in_shape.dims[1];
+        let w_in = in_shape.dims[2];
+        let c_in = in_shape.dims[3];
+        let c_out = out_shape.dims[3];
+        let in_name = op.inputs[0].clone();
+        let w_name = op.inputs[1].clone();
+        let out_name = op.outputs[0].clone();
+        let (input, kernel, output) =
+            Self::get_three_buffers(&mut self.buffers, &in_name, &w_name, &out_name)?;
+        rec.record_conv2d_requant_relu_i8_packed(
+            input,
+            kernel,
+            output,
+            n,
+            h_in,
+            w_in,
+            c_in,
+            c_out,
+            kernel_shape[0],
+            kernel_shape[1],
+            strides[0],
+            strides[1],
+            pads[0],
+            pads[1],
+            requant_scale,
+            has_relu,
+        )
+        .map_err(|e| Error::Runtime(format!("vk record conv2d_requant_relu_i8: {e}")))
     }
 
     // =========================================================================
@@ -618,15 +1414,22 @@ impl VulkanGraphRuntime {
         dragonwing_vulkan::ops::gemm_f32(&self.backend, a, b, c, m, n, k)
             .map_err(|e| Error::Runtime(format!("vk gemm_f32: {e}")))?;
 
-        // Bias handling (op.inputs[2]) — Phase 2: error if present, since
-        // gemm_f32 has no bias variant. Phase 6 can add a fused gemm+bias
-        // shader or insert an Add pass.
+        // Bias handling (op.inputs[2]) — Task 008 Phase 2: insert a
+        // broadcasting bias-add pass after the gemm. bias has shape [N];
+        // C has shape [M, N]; we broadcast bias over rows by using c_out=N.
         if op.inputs.len() > 2 && !op.inputs[2].is_empty() {
-            return Err(Error::Runtime(
-                "vk gemm: bias not supported in Phase 2; preprocess model \
-                 or use CpuGraphRuntime"
-                    .into(),
-            ));
+            let bias_name = op.inputs[2].clone();
+            let bias_n = self
+                .buffers
+                .get(&bias_name)
+                .map(|b| b.len_bytes() / 4)
+                .unwrap_or(0);
+            if bias_n == n {
+                let (bias, c) =
+                    Self::get_two_buffers(&mut self.buffers, &bias_name, &c_name_str)?;
+                dragonwing_vulkan::ops::bias_add_f32_nhwc(&self.backend, c, bias, n)
+                    .map_err(|e| Error::Runtime(format!("vk gemm bias_add: {e}")))?;
+            }
         }
         Ok(())
     }
@@ -678,11 +1481,12 @@ impl VulkanGraphRuntime {
                 "vk conv2d: group={group} not supported (need depthwise shader)"
             )));
         }
-        if op.inputs.len() > 2 && !op.inputs[2].is_empty() {
-            return Err(Error::Runtime(
-                "vk conv2d: bias not yet supported in Phase 2".into(),
-            ));
-        }
+
+        let bias_name: Option<String> = if op.inputs.len() > 2 && !op.inputs[2].is_empty() {
+            Some(op.inputs[2].clone())
+        } else {
+            None
+        };
 
         let in_name = in_name.clone();
         let w_name = w_name.clone();
@@ -706,7 +1510,39 @@ impl VulkanGraphRuntime {
             pad_h,
             pad_w,
         )
-        .map_err(|e| Error::Runtime(format!("vk conv2d_f32_nhwc: {e}")))
+        .map_err(|e| Error::Runtime(format!("vk conv2d_f32_nhwc: {e}")))?;
+
+        // Bias handling (op.inputs[2]) — Task 008 Phase 2: broadcasting
+        // bias-add pass after the conv. Bias shape is [C_out]; output shape
+        // is [N, H_out, W_out, C_out]. The bias_add_f32_nhwc shader uses
+        // i % c_out as the bias index, which is correct for NHWC layout.
+        if let Some(bias_name) = bias_name {
+            // Verify the bias buffer's element count matches c_out. ONNX
+            // sometimes carries scalar/empty bias initializers when BN
+            // folding has already absorbed the bias; in that case we
+            // skip the add to avoid a shape mismatch (and a GPU read of
+            // uninitialised memory, which Turnip translates to a
+            // device-lost on Adreno A702).
+            let bias_n = self
+                .buffers
+                .get(&bias_name)
+                .map(|b| b.len_bytes() / 4)
+                .unwrap_or(0);
+            if bias_n != c_out {
+                eprintln!(
+                    "  conv2d: skipping bias_add for `{out_name}` — bias {bias_name} \
+                     has {bias_n} elems, c_out={c_out}"
+                );
+            } else if std::env::var("DRAGONWING_SKIP_BIAS").is_ok() {
+                // Debug toggle: skip bias_add to isolate conv from bias.
+            } else {
+                let (bias, output) =
+                    Self::get_two_buffers(&mut self.buffers, &bias_name, &out_name)?;
+                dragonwing_vulkan::ops::bias_add_f32_nhwc(&self.backend, output, bias, c_out)
+                    .map_err(|e| Error::Runtime(format!("vk conv2d bias_add: {e}")))?;
+            }
+        }
+        Ok(())
     }
 
     fn dispatch_maxpool(
@@ -851,6 +1687,393 @@ impl VulkanGraphRuntime {
         let (input, output) = Self::get_two_buffers(&mut self.buffers, &in_name, &out_name)?;
         dragonwing_vulkan::ops::dequantize_i8_packed_to_f32(&self.backend, input, output, scale)
             .map_err(|e| Error::Runtime(format!("vk dequantize: {e}")))
+    }
+
+    // =========================================================================
+    // Task 008 — Fused INT8 Conv + Requantize + (optional) Relu dispatcher
+    // =========================================================================
+    //
+    // Emitted by the fusion pass when a `Conv → Requantize (→ Relu)` chain is
+    // detected in an INT8 graph. The fused shader
+    // (`conv2d_requant_relu_i8_packed.comp`) reads packed I8 inputs and
+    // weights, accumulates in I32 inside the shader, requantises with the
+    // provided scale, and writes packed I8 directly to the output buffer —
+    // skipping the intermediate I32 tensor that the unfused path would
+    // allocate.
+    //
+    // Constraints (enforced by the underlying op wrapper):
+    //   - `c_in % 4 == 0` and `c_out % 4 == 0` (UINT32 packing).
+    //   - `group == 1` (no depthwise).
+    //   - bias not supported here (must be folded at compile time).
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_conv2d_requant_relu_i8(
+        &mut self,
+        op: &CompiledOp,
+        kernel_shape: [usize; 2],
+        strides: [usize; 2],
+        pads: [usize; 4],
+        group: usize,
+        requant_scale: f32,
+        has_relu: bool,
+    ) -> Result<()> {
+        if op.inputs.len() < 2 || op.outputs.is_empty() {
+            return Err(Error::Runtime(
+                "conv2d_requant_relu_i8: needs ≥2 inputs and 1 output".into(),
+            ));
+        }
+        if group != 1 {
+            return Err(Error::Runtime(format!(
+                "conv2d_requant_relu_i8: group={group} not supported"
+            )));
+        }
+        if op.inputs.len() > 2 && !op.inputs[2].is_empty() {
+            return Err(Error::Runtime(
+                "conv2d_requant_relu_i8: bias must be folded at compile time".into(),
+            ));
+        }
+
+        let in_name = &op.inputs[0];
+        let w_name = &op.inputs[1];
+        let out_name = &op.outputs[0];
+
+        let in_shape = self
+            .graph
+            .shapes
+            .get(in_name)
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {in_name}")))?;
+        let out_shape = self
+            .graph
+            .shapes
+            .get(out_name)
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {out_name}")))?;
+
+        if in_shape.dims.len() != 4 || out_shape.dims.len() != 4 {
+            return Err(Error::Runtime(
+                "conv2d_requant_relu_i8: input and output must be 4D NHWC".into(),
+            ));
+        }
+
+        let n = in_shape.dims[0];
+        let h_in = in_shape.dims[1];
+        let w_in = in_shape.dims[2];
+        let c_in = in_shape.dims[3];
+        let c_out = out_shape.dims[3];
+
+        let k_h = kernel_shape[0];
+        let k_w = kernel_shape[1];
+        let stride_h = strides[0];
+        let stride_w = strides[1];
+        let pad_h = pads[0];
+        let pad_w = pads[1];
+
+        let in_name = in_name.clone();
+        let w_name = w_name.clone();
+        let out_name = out_name.clone();
+        let (input, kernel, output) =
+            Self::get_three_buffers(&mut self.buffers, &in_name, &w_name, &out_name)?;
+
+        dragonwing_vulkan::ops::conv2d_requant_relu_i8_packed(
+            &self.backend,
+            input,
+            kernel,
+            output,
+            n,
+            h_in,
+            w_in,
+            c_in,
+            c_out,
+            k_h,
+            k_w,
+            stride_h,
+            stride_w,
+            pad_h,
+            pad_w,
+            requant_scale,
+            has_relu,
+        )
+        .map_err(|e| Error::Runtime(format!("vk conv2d_requant_relu_i8: {e}")))
+    }
+
+    // =========================================================================
+    // Task 008 Phase 6 — CPU fallback dispatchers.
+    //
+    // For ops that don't yet have Vulkan shaders (Sub, Div, Concat,
+    // Resize, Split, Transpose, Slice) we download the inputs, run a
+    // CPU implementation from `dragonwing-cpu`, and upload the result.
+    // The caller (run()) has already flushed/synchronised any pending
+    // GPU work before invoking these.
+    // =========================================================================
+
+    fn download_f32(&self, name: &str) -> Result<Vec<f32>> {
+        let buf = self
+            .buffers
+            .get(name)
+            .ok_or_else(|| Error::Runtime(format!("buffer not found: {name}")))?;
+        let n_bytes = buf.len_bytes();
+        if !n_bytes.is_multiple_of(4) {
+            return Err(Error::Runtime(format!(
+                "{name}: byte length {n_bytes} not multiple of 4"
+            )));
+        }
+        let mut bytes = vec![0u8; n_bytes];
+        self.backend
+            .download(buf, &mut bytes)
+            .map_err(|e| Error::Runtime(format!("download {name}: {e}")))?;
+        let mut out = vec![0f32; n_bytes / 4];
+        for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+            out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        Ok(out)
+    }
+
+    fn upload_f32(&mut self, name: &str, data: &[f32]) -> Result<()> {
+        let buf = self
+            .buffers
+            .get_mut(name)
+            .ok_or_else(|| Error::Runtime(format!("buffer not found: {name}")))?;
+        let expected = data.len() * 4;
+        if buf.len_bytes() != expected {
+            return Err(Error::Runtime(format!(
+                "{name} upload size mismatch: buf={} data={}",
+                buf.len_bytes(),
+                expected,
+            )));
+        }
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), expected) };
+        self.backend
+            .upload(buf, bytes)
+            .map_err(|e| Error::Runtime(format!("upload {name}: {e}")))
+    }
+
+    fn dispatch_cpu_sub(&mut self, op: &CompiledOp) -> Result<()> {
+        if op.inputs.len() < 2 || op.outputs.is_empty() {
+            return Err(Error::Runtime("cpu_sub: needs 2 inputs + 1 output".into()));
+        }
+        let a = self.download_f32(&op.inputs[0])?;
+        let b = self.download_f32(&op.inputs[1])?;
+        let out_size = self
+            .graph
+            .shapes
+            .get(&op.outputs[0])
+            .map(|s| s.numel())
+            .unwrap_or(a.len());
+        let mut out = vec![0f32; out_size];
+        if a.len() == b.len() {
+            dragonwing_cpu::ops::sub_f32(&mut out, &a, &b);
+        } else if b.len() == 1 {
+            let bv = b[0];
+            for (o, &av) in out.iter_mut().zip(a.iter()) {
+                *o = av - bv;
+            }
+        } else {
+            let c = b.len();
+            for (i, (o, &av)) in out.iter_mut().zip(a.iter()).enumerate() {
+                *o = av - b[i % c];
+            }
+        }
+        self.upload_f32(&op.outputs[0], &out)
+    }
+
+    fn dispatch_cpu_div(&mut self, op: &CompiledOp) -> Result<()> {
+        if op.inputs.len() < 2 || op.outputs.is_empty() {
+            return Err(Error::Runtime("cpu_div: needs 2 inputs + 1 output".into()));
+        }
+        let a = self.download_f32(&op.inputs[0])?;
+        let b = self.download_f32(&op.inputs[1])?;
+        let out_size = self
+            .graph
+            .shapes
+            .get(&op.outputs[0])
+            .map(|s| s.numel())
+            .unwrap_or(a.len());
+        let mut out = vec![0f32; out_size];
+        if a.len() == b.len() {
+            dragonwing_cpu::ops::div_f32(&mut out, &a, &b);
+        } else if b.len() == 1 {
+            let bv = b[0];
+            for (o, &av) in out.iter_mut().zip(a.iter()) {
+                *o = av / bv;
+            }
+        } else {
+            let c = b.len();
+            for (i, (o, &av)) in out.iter_mut().zip(a.iter()).enumerate() {
+                *o = av / b[i % c];
+            }
+        }
+        self.upload_f32(&op.outputs[0], &out)
+    }
+
+    fn dispatch_cpu_concat(&mut self, op: &CompiledOp, axis: usize) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("cpu_concat: missing input/output".into()));
+        }
+        let mut input_shapes: Vec<[usize; 4]> = Vec::with_capacity(op.inputs.len());
+        let mut input_data: Vec<Vec<f32>> = Vec::with_capacity(op.inputs.len());
+        for in_name in &op.inputs {
+            let shape = self
+                .graph
+                .shapes
+                .get(in_name)
+                .ok_or_else(|| Error::Runtime(format!("shape not found: {in_name}")))?;
+            let mut dims = [1usize; 4];
+            let offset = 4 - shape.dims.len();
+            for (i, &d) in shape.dims.iter().enumerate() {
+                dims[offset + i] = d;
+            }
+            input_shapes.push(dims);
+            input_data.push(self.download_f32(in_name)?);
+        }
+        let inputs: Vec<&[f32]> = input_data.iter().map(|v| v.as_slice()).collect();
+        let out_size = self
+            .graph
+            .shapes
+            .get(&op.outputs[0])
+            .map(|s| s.numel())
+            .ok_or_else(|| Error::Runtime("output shape not found".into()))?;
+        let mut out = vec![0f32; out_size];
+        dragonwing_cpu::ops::concat_f32(&mut out, &inputs, &input_shapes, axis);
+        self.upload_f32(&op.outputs[0], &out)
+    }
+
+    fn dispatch_cpu_resize(
+        &mut self,
+        op: &CompiledOp,
+        out_h: usize,
+        out_w: usize,
+        mode: &str,
+    ) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("cpu_resize: missing input/output".into()));
+        }
+        let in_shape = self
+            .graph
+            .shapes
+            .get(&op.inputs[0])
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {}", op.inputs[0])))?
+            .clone();
+        if in_shape.dims.len() != 4 {
+            return Err(Error::Runtime("cpu_resize: input must be 4D".into()));
+        }
+        // After convert_nchw_to_nhwc the dims are [N, H, W, C].
+        let n = in_shape.dims[0];
+        let h_in = in_shape.dims[1];
+        let w_in = in_shape.dims[2];
+        let c = in_shape.dims[3];
+        let resize_mode = match mode {
+            "nearest" => dragonwing_cpu::ops::ResizeMode::Nearest,
+            "linear" => dragonwing_cpu::ops::ResizeMode::Bilinear,
+            other => {
+                return Err(Error::Runtime(format!(
+                    "cpu_resize: unsupported mode {other}"
+                )));
+            }
+        };
+        let input = self.download_f32(&op.inputs[0])?;
+        let mut out = vec![0f32; n * out_h * out_w * c];
+        dragonwing_cpu::ops::resize_f32(
+            &mut out, &input, n, h_in, w_in, out_h, out_w, c, resize_mode,
+        );
+        self.upload_f32(&op.outputs[0], &out)
+    }
+
+    fn dispatch_cpu_split(
+        &mut self,
+        op: &CompiledOp,
+        axis: usize,
+        split_sizes: &[usize],
+    ) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("cpu_split: missing input/output".into()));
+        }
+        let in_shape = self
+            .graph
+            .shapes
+            .get(&op.inputs[0])
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {}", op.inputs[0])))?
+            .clone();
+        let mut dims = [1usize; 4];
+        let offset = 4 - in_shape.dims.len();
+        for (i, &d) in in_shape.dims.iter().enumerate() {
+            dims[offset + i] = d;
+        }
+        let input = self.download_f32(&op.inputs[0])?;
+        let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(op.outputs.len());
+        for &split_size in split_sizes {
+            let mut split_dims = dims;
+            split_dims[axis] = split_size;
+            outputs.push(vec![0f32; split_dims.iter().product()]);
+        }
+        let mut output_slices: Vec<&mut [f32]> =
+            outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        dragonwing_cpu::ops::split_f32(&mut output_slices, &input, dims, axis, split_sizes);
+        for (i, out_name) in op.outputs.iter().enumerate() {
+            self.upload_f32(out_name, &outputs[i])?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_cpu_transpose(&mut self, op: &CompiledOp, perm: &[usize]) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("cpu_transpose: missing input/output".into()));
+        }
+        let in_shape = self
+            .graph
+            .shapes
+            .get(&op.inputs[0])
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {}", op.inputs[0])))?
+            .clone();
+        let input = self.download_f32(&op.inputs[0])?;
+        let mut out = vec![0f32; input.len()];
+        // Pad shape and perm to 4D.
+        let mut dims4 = [1usize; 4];
+        let offset = 4 - in_shape.dims.len();
+        for (i, &d) in in_shape.dims.iter().enumerate() {
+            dims4[offset + i] = d;
+        }
+        let mut perm4 = [0usize, 1, 2, 3];
+        // ONNX perm length matches input rank; shift by offset.
+        for (i, &p) in perm.iter().enumerate() {
+            perm4[offset + i] = p + offset;
+        }
+        dragonwing_cpu::ops::transpose_f32(&mut out, &input, dims4, perm4);
+        self.upload_f32(&op.outputs[0], &out)
+    }
+
+    fn dispatch_cpu_slice(
+        &mut self,
+        op: &CompiledOp,
+        starts: &[isize],
+        ends: &[isize],
+        axes: &[usize],
+        steps: &[isize],
+    ) -> Result<()> {
+        if op.inputs.is_empty() || op.outputs.is_empty() {
+            return Err(Error::Runtime("cpu_slice: missing input/output".into()));
+        }
+        let in_shape = self
+            .graph
+            .shapes
+            .get(&op.inputs[0])
+            .ok_or_else(|| Error::Runtime(format!("shape not found: {}", op.inputs[0])))?
+            .clone();
+        let out_size = self
+            .graph
+            .shapes
+            .get(&op.outputs[0])
+            .map(|s| s.numel())
+            .ok_or_else(|| Error::Runtime("cpu_slice: output shape not found".into()))?;
+        let input = self.download_f32(&op.inputs[0])?;
+        let mut out = vec![0f32; out_size];
+        // Pad shape to 4D.
+        let mut dims4 = [1usize; 4];
+        let offset = 4 - in_shape.dims.len();
+        for (i, &d) in in_shape.dims.iter().enumerate() {
+            dims4[offset + i] = d;
+        }
+        dragonwing_cpu::ops::slice_f32(&mut out, &input, dims4, starts, ends, axes, steps);
+        self.upload_f32(&op.outputs[0], &out)
     }
 
     /// INT8 ReLU on packed tensors. Not in `OpParams` directly — exposed via a
@@ -1403,6 +2626,312 @@ mod tests {
         let expected = [4.0f32, 5.0, 10.0, 11.0];
         for (i, (exp, got)) in expected.iter().zip(c.iter()).enumerate() {
             assert!((exp - got).abs() < 1e-4, "gemm[{i}]: {exp} vs {got}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 008 Phase 2 tests: F32 bias broadcasting for Conv/Gemm.
+    // -----------------------------------------------------------------------
+
+    /// Build a graph: c = a × b + bias, with M=2, K=3, N=4 and bias of shape [4].
+    fn gemm_with_bias_graph() -> Graph {
+        let mut shapes = HashMap::new();
+        shapes.insert("a".into(), TensorShape::new(vec![2, 3], Dtype::F32));
+        shapes.insert("b".into(), TensorShape::new(vec![3, 4], Dtype::F32));
+        shapes.insert("bias".into(), TensorShape::new(vec![4], Dtype::F32));
+        shapes.insert("c".into(), TensorShape::new(vec![2, 4], Dtype::F32));
+        let ops = vec![CompiledOp {
+            name: "gemm_bias".into(),
+            op_type: "Gemm".into(),
+            inputs: vec!["a".into(), "b".into(), "bias".into()],
+            outputs: vec!["c".into()],
+            params: OpParams::Gemm {
+                alpha: 1.0,
+                beta: 1.0,
+                trans_a: false,
+                trans_b: false,
+            },
+        }];
+        Graph {
+            ops,
+            shapes,
+            inputs: vec!["a".into(), "b".into(), "bias".into()],
+            outputs: vec!["c".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::F32,
+        }
+    }
+
+    #[test]
+    fn gemm_with_bias_matches_reference() {
+        let Some(backend) = try_make_backend() else {
+            eprintln!("skipping: no Vulkan device available");
+            return;
+        };
+        let mut rt = VulkanGraphRuntime::new(gemm_with_bias_graph(), backend).expect("new");
+
+        // a is 2×3
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        // b is 3×4, identity-ish so the matmul produces a recognisable result
+        // Use a structured pattern: b[k,n] = (k+1) * (n+1)
+        let b: Vec<f32> = {
+            let mut v = vec![0.0; 12];
+            for k in 0..3 {
+                for n in 0..4 {
+                    v[k * 4 + n] = (k as f32 + 1.0) * (n as f32 + 1.0);
+                }
+            }
+            v
+        };
+        let bias: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0];
+
+        rt.set_input_f32("a", &a).expect("set a");
+        rt.set_input_f32("b", &b).expect("set b");
+        rt.set_input_f32("bias", &bias).expect("set bias");
+        rt.run().expect("run");
+        let c = rt.get_output_f32("c").expect("get c");
+
+        // Reference CPU compute: c[m,n] = sum_k a[m,k]*b[k,n] + bias[n]
+        for m in 0..2 {
+            for n in 0..4 {
+                let mut acc = 0.0f32;
+                for k in 0..3 {
+                    acc += a[m * 3 + k] * b[k * 4 + n];
+                }
+                let exp = acc + bias[n];
+                let got = c[m * 4 + n];
+                assert!(
+                    (exp - got).abs() < 1e-4,
+                    "gemm_bias[{m},{n}]: exp={exp} got={got}"
+                );
+            }
+        }
+    }
+
+    /// Build a conv graph with bias: 1×3×3×4 input, 1×1 kernel, 4→2 channels, bias[2].
+    fn conv_with_bias_graph() -> Graph {
+        let mut shapes = HashMap::new();
+        shapes.insert("x".into(), TensorShape::new(vec![1, 3, 3, 4], Dtype::F32));
+        // Kernel for conv2d_f32_nhwc: layout [k_h, k_w, c_in, c_out]
+        shapes.insert("w".into(), TensorShape::new(vec![1, 1, 4, 2], Dtype::F32));
+        shapes.insert("bias".into(), TensorShape::new(vec![2], Dtype::F32));
+        shapes.insert("y".into(), TensorShape::new(vec![1, 3, 3, 2], Dtype::F32));
+        let ops = vec![CompiledOp {
+            name: "conv_bias".into(),
+            op_type: "Conv".into(),
+            inputs: vec!["x".into(), "w".into(), "bias".into()],
+            outputs: vec!["y".into()],
+            params: OpParams::Conv2d {
+                kernel_shape: [1, 1],
+                strides: [1, 1],
+                pads: [0, 0, 0, 0],
+                dilations: [1, 1],
+                group: 1,
+            },
+        }];
+        Graph {
+            ops,
+            shapes,
+            inputs: vec!["x".into(), "w".into(), "bias".into()],
+            outputs: vec!["y".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::F32,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 008 Phase 4 tests: single-command-buffer (batched) execution.
+    // -----------------------------------------------------------------------
+
+    /// Build a graph with two dependent ops: sigmoid → mul, so we can verify
+    /// that the inserted barrier correctly serialises them.
+    fn two_op_chain_graph() -> Graph {
+        let mut shapes = HashMap::new();
+        shapes.insert("x".into(), TensorShape::new(vec![8], Dtype::F32));
+        shapes.insert("s".into(), TensorShape::new(vec![8], Dtype::F32));
+        shapes.insert("z".into(), TensorShape::new(vec![8], Dtype::F32));
+        let ops = vec![
+            CompiledOp {
+                name: "sig1".into(),
+                op_type: "Sigmoid".into(),
+                inputs: vec!["x".into()],
+                outputs: vec!["s".into()],
+                params: OpParams::Sigmoid,
+            },
+            CompiledOp {
+                name: "mul1".into(),
+                op_type: "Mul".into(),
+                inputs: vec!["x".into(), "s".into()],
+                outputs: vec!["z".into()],
+                params: OpParams::Mul,
+            },
+        ];
+        Graph {
+            ops,
+            shapes,
+            inputs: vec!["x".into()],
+            outputs: vec!["z".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::F32,
+        }
+    }
+
+    #[test]
+    fn slab_packing_yields_one_allocation_for_small_graph() {
+        let Some(backend) = try_make_backend() else {
+            eprintln!("skipping: no Vulkan device available");
+            return;
+        };
+        // 10 tensors of ~32 bytes each: total <1 MiB → must fit in one slab.
+        let mut shapes = HashMap::new();
+        for i in 0..10 {
+            shapes.insert(
+                format!("t{i}"),
+                TensorShape::new(vec![1, 8], Dtype::F32),
+            );
+        }
+        let graph = Graph {
+            ops: Vec::new(),
+            shapes,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            initializers: HashMap::new(),
+            dtype: Dtype::F32,
+        };
+        let rt = VulkanGraphRuntime::new(graph, backend).expect("new");
+        // Phase 5 acceptance: <10 vkAllocateMemory calls (i.e. <10 slabs).
+        // For a tiny graph this should be exactly 1.
+        let slab_count = rt.slab_count();
+        assert!(
+            slab_count <= 1,
+            "expected ≤1 slab for 10-tensor graph, got {slab_count}"
+        );
+        if let Some(stats) = rt.slab_stats() {
+            assert_eq!(stats.num_slabs, slab_count);
+            assert!(
+                stats.bytes_in_use >= 10 * 256,
+                "bytes_in_use {} too small",
+                stats.bytes_in_use
+            );
+        }
+    }
+
+    #[test]
+    fn batched_run_matches_reference() {
+        let Some(backend) = try_make_backend() else {
+            eprintln!("skipping: no Vulkan device available");
+            return;
+        };
+        let mut rt = VulkanGraphRuntime::new(two_op_chain_graph(), backend).expect("new");
+        let x = vec![-3.0f32, -1.0, 0.0, 0.5, 1.0, 2.0, -0.5, 1.5];
+        rt.set_input_f32("x", &x).expect("set");
+        // run() now uses the single-command-buffer recorder + barriers.
+        rt.run().expect("batched run");
+        let z = rt.get_output_f32("z").expect("get");
+        for (i, &xi) in x.iter().enumerate() {
+            let sig = 1.0 / (1.0 + (-xi).exp());
+            let expected = xi * sig;
+            assert!(
+                (expected - z[i]).abs() < 1e-4,
+                "batched silu mismatch at {i}: {expected} vs {}",
+                z[i]
+            );
+        }
+    }
+
+    #[test]
+    fn needs_barrier_detects_immediate_dependency() {
+        // Build two-op chain: op0 outputs "a", op1 reads "a".
+        let ops = vec![
+            CompiledOp {
+                name: "op0".into(),
+                op_type: "Relu".into(),
+                inputs: vec!["x".into()],
+                outputs: vec!["a".into()],
+                params: OpParams::None,
+            },
+            CompiledOp {
+                name: "op1".into(),
+                op_type: "Relu".into(),
+                inputs: vec!["a".into()],
+                outputs: vec!["y".into()],
+                params: OpParams::None,
+            },
+        ];
+        assert!(VulkanGraphRuntime::needs_barrier(&ops, 1));
+    }
+
+    #[test]
+    fn needs_barrier_skips_independent_ops() {
+        // op0 outputs "a", op1 reads "x" (input only). No barrier needed.
+        let ops = vec![
+            CompiledOp {
+                name: "op0".into(),
+                op_type: "Relu".into(),
+                inputs: vec!["x".into()],
+                outputs: vec!["a".into()],
+                params: OpParams::None,
+            },
+            CompiledOp {
+                name: "op1".into(),
+                op_type: "Relu".into(),
+                inputs: vec!["x".into()],
+                outputs: vec!["b".into()],
+                params: OpParams::None,
+            },
+        ];
+        assert!(!VulkanGraphRuntime::needs_barrier(&ops, 1));
+    }
+
+    #[test]
+    fn conv2d_with_bias_matches_reference() {
+        let Some(backend) = try_make_backend() else {
+            eprintln!("skipping: no Vulkan device available");
+            return;
+        };
+        let mut rt =
+            VulkanGraphRuntime::new(conv_with_bias_graph(), backend).expect("new");
+
+        // Input: 1×3×3×4 = 36 elements, deterministic pattern.
+        let mut x = vec![0.0f32; 36];
+        for i in 0..36 {
+            x[i] = (i as f32) * 0.1 - 1.0;
+        }
+        // Kernel: 1×1×4×2 = 8 elements. Pattern: w[k_h, k_w, c_in, c_out].
+        // For a 1×1 conv, this reduces to a [4×2] matmul per spatial.
+        let w: Vec<f32> = vec![
+            // c_in=0: c_out 0, 1
+            0.5, -0.25,
+            // c_in=1
+            0.1, 0.2,
+            // c_in=2
+            -0.3, 0.4,
+            // c_in=3
+            0.7, 0.0,
+        ];
+        let bias: Vec<f32> = vec![100.0, -50.0];
+
+        rt.set_input_f32("x", &x).expect("set x");
+        rt.set_input_f32("w", &w).expect("set w");
+        rt.set_input_f32("bias", &bias).expect("set bias");
+        rt.run().expect("run");
+        let y = rt.get_output_f32("y").expect("get y");
+
+        // Reference: for each spatial position s in 0..9, for each oc in 0..2,
+        //   y[s, oc] = sum_{ic=0..4} x[s, ic] * w[ic, oc] + bias[oc]
+        for s in 0..9 {
+            for oc in 0..2 {
+                let mut acc = 0.0f32;
+                for ic in 0..4 {
+                    acc += x[s * 4 + ic] * w[ic * 2 + oc];
+                }
+                let exp = acc + bias[oc];
+                let got = y[s * 2 + oc];
+                assert!(
+                    (exp - got).abs() < 1e-4,
+                    "conv_bias[s={s},oc={oc}]: exp={exp} got={got}"
+                );
+            }
         }
     }
 }

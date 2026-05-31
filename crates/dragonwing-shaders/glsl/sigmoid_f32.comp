@@ -27,13 +27,16 @@ layout(set = 0, binding = 1, std430) readonly buffer XBuf {
 
 layout(push_constant) uniform Pc {
     uint  n;
-    uint  _pad0;
+    uint  gx_total;  // grid X size, used to flatten 2D dispatch
     uint  _pad1;
     uint  _pad2;
 } pc;
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    // 2D-wrapped flat index: lets us address up to gx*gy*64 elements
+    // without exceeding Adreno A702's maxComputeWorkGroupCount[0]=65535.
+    uint flat_wg = gl_WorkGroupID.y * pc.gx_total + gl_WorkGroupID.x;
+    uint gid = flat_wg * 64u + gl_LocalInvocationID.x;
     if (gid >= pc.n) {
         return;
     }

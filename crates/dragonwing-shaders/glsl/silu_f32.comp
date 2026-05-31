@@ -38,13 +38,14 @@ layout(set = 0, binding = 1, std430) readonly buffer InputBuf {
 
 layout(push_constant) uniform Pc {
     uint n;
-    uint _pad0;
+    uint gx_total;
     uint _pad1;
     uint _pad2;
 } pc;
 
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
+    uint flat_wg = gl_WorkGroupID.y * pc.gx_total + gl_WorkGroupID.x;
+    uint idx = flat_wg * 64u + gl_LocalInvocationID.x;
     if (idx >= pc.n) {
         return;
     }

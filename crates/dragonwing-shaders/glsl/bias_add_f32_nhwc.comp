@@ -1,0 +1,56 @@
+#version 450
+//
+// bias_add_f32_nhwc — Broadcast 1D bias[C] over NHWC tensor in-place.
+//
+// For an NHWC tensor of layout [N, H, W, C] (flattened as a 1D buffer of
+// length N*H*W*C), this adds bias[c] to every element where c = i % C.
+//
+// Conventions match `add_f32`: float buffers, std430 layout, 64-wide
+// workgroups. The "in-place" form binds the same buffer for output and
+// input[0] without aliasing issues (Vulkan std430 storage buffers permit
+// read-modify-write within a single dispatch).
+//
+// Bindings:
+//   set=0 binding=0  std430 buffer Y[]      (read+write, N*H*W*C elements)
+//   set=0 binding=1  std430 buffer Bias[]   (read-only, C elements)
+//
+// Push constants (16 bytes):
+//   uint n      — total element count (N*H*W*C)
+//   uint c_out  — channels per spatial element (broadcast modulus)
+//   uint _pad0
+//   uint _pad1
+//
+// Dispatch:
+//   gx = ceil(n / 64), gy = gz = 1.
+
+// 2D dispatch (x,y) — flattens to gid = y*gx_total + x. Lets us address
+// up to 65535*65535*64 ~= 268 billion elements without hitting Adreno's
+// per-axis maxComputeWorkGroupCount=65535 limit.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer YBuf {
+    float y[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer BiasBuf {
+    float bias_data[];
+};
+
+layout(push_constant) uniform Pc {
+    uint n;
+    uint c_out;
+    uint gx_total;  // gx_total * 64 = total invocations addressable from x alone
+    uint _pad1;
+} pc;
+
+void main() {
+    // Flatten 2D grid: gid = (y*gx + x)*64 + local_x  (local_y always 0)
+    uint flat_wg = gl_WorkGroupID.y * pc.gx_total + gl_WorkGroupID.x;
+    uint gid = flat_wg * 64u + gl_LocalInvocationID.x;
+    if (gid >= pc.n) {
+        return;
+    }
+    uint c = gid % pc.c_out;
+    y[gid] = y[gid] + bias_data[c];
+}

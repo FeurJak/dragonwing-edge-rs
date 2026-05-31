@@ -8,6 +8,9 @@
 //! - **Conv-Bias-Relu**: Fuse Conv + Add (bias) + Relu into a single fused conv
 //! - **Conv-Relu**: Fuse Conv + Relu (when bias is already absorbed)
 //! - **Mul-Sigmoid** (SiLU): x * sigmoid(x) pattern common in YOLO
+//! - **Conv-Requant-Relu (INT8)**: Fuse the quantized triple emitted by the
+//!   `QuantizedGraphCompiler` into a single
+//!   `OpParams::Conv2dRequantReluI8Nhwc` op (Task 008).
 //!
 //! # How Fusion Works
 //!
@@ -186,6 +189,150 @@ pub fn apply_fusion_passes(graph: &mut Graph) {
         fused_ops.push((i, fused));
     }
     
+    // Pass 3: Fuse Conv (INT8) + Requantize + (optional) Relu — Task 008.
+    //
+    // Pattern emitted by `QuantizedGraphCompiler`:
+    //
+    //   Conv      : inputs = [activations_i8, weights_i8 (, bias?)]    op_type "Conv"
+    //               outputs = [conv_out]              -- with OpParams::Conv2d
+    //   Requantize: inputs = ["{conv_out}_i32"]                       op_type "Requantize"
+    //               outputs = [conv_out]              -- with OpParams::Requantize
+    //   Relu      : inputs = [conv_out]                                op_type "Relu"
+    //               outputs = [relu_out]              -- optional; if absent we still fuse
+    //                                                    Conv+Requant to skip the I32 buffer
+    //
+    // We rewrite the Conv op into the fused variant and remove the Requantize
+    // (and Relu, if matched). The fused op writes directly to the final output
+    // name (`relu_out` if relu was matched, else the requantize's `conv_out`).
+    for (i, op) in graph.ops.iter().enumerate() {
+        if ops_to_remove.contains(&i) {
+            continue;
+        }
+        
+        // Anchor on Requantize (always present in the INT8 conv chain).
+        if op.op_type != "Requantize" {
+            continue;
+        }
+        
+        // The requant op's input is the renamed I32 accumulator
+        // (e.g. "foo_i32"). The producing op is the Conv that emitted it
+        // implicitly. We locate the Conv by matching its output to the
+        // requantize's *output* name (the original tensor name).
+        let final_name = match op.outputs.first() {
+            Some(n) => n.clone(),
+            None => continue,
+        };
+        
+        // Find the Conv whose output == final_name and which is the *direct*
+        // predecessor of this requantize (so they were emitted as a pair).
+        // We scan all earlier ops because the I32 accumulator buffer is
+        // synthesised and not tracked in `tensor_producer`.
+        let conv_idx = match graph.ops[..i].iter().rposition(|prev| {
+            prev.op_type == "Conv"
+                && prev.outputs.first().map(|s| s.as_str()) == Some(final_name.as_str())
+                && matches!(prev.params, OpParams::Conv2d { .. })
+        }) {
+            Some(idx) => idx,
+            None => continue,
+        };
+        if ops_to_remove.contains(&conv_idx) {
+            continue;
+        }
+        
+        // Conv must have at most weights as input[1] (we don't fuse biased
+        // INT8 conv at this stage; bias-folding happens in quantize.rs).
+        let conv_op = &graph.ops[conv_idx];
+        if conv_op.inputs.len() < 2 {
+            continue;
+        }
+        
+        // Extract conv params.
+        let (kernel_shape, strides, pads, dilations, group) = match &conv_op.params {
+            OpParams::Conv2d { kernel_shape, strides, pads, dilations, group } => {
+                (*kernel_shape, *strides, *pads, *dilations, *group)
+            }
+            _ => continue,
+        };
+        
+        // The fused shader currently supports group=1 only.
+        if group != 1 {
+            continue;
+        }
+        
+        // Extract requant scale.
+        let requant_scale = match &op.params {
+            OpParams::Requantize { scale } => *scale,
+            _ => continue,
+        };
+        
+        // Look for a Relu directly consuming the requantize output (with the
+        // requant being its only consumer). If found, fuse it in too.
+        let relu_idx = tensor_consumers.get(&final_name).and_then(|consumers| {
+            // Filter out already-removed consumers and the requantize op itself.
+            let live: Vec<usize> = consumers
+                .iter()
+                .copied()
+                .filter(|&c| c != i && !ops_to_remove.contains(&c))
+                .collect();
+            if live.len() == 1 {
+                let r = live[0];
+                if graph.ops[r].op_type == "Relu" {
+                    Some(r)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        
+        // Compute the output name of the fused op:
+        // - With relu: use relu's output (so downstream ops see the same tensor name).
+        // - Without relu: keep `final_name` (requant's output).
+        let (fused_output, has_relu) = if let Some(ridx) = relu_idx {
+            let r = &graph.ops[ridx];
+            let oname = match r.outputs.first() {
+                Some(n) => n.clone(),
+                None => final_name.clone(),
+            };
+            (oname, true)
+        } else {
+            (final_name.clone(), false)
+        };
+        
+        // Skip the trivial case where Conv has a bias (input[2] non-empty).
+        // Bias-folding is handled by quantize.rs separately; if a bias arrived
+        // here we treat the conv as biased and refuse to fuse to avoid silent
+        // accuracy loss.
+        if conv_op.inputs.len() > 2 && !conv_op.inputs[2].is_empty() {
+            continue;
+        }
+        
+        // Build the fused op.
+        let fused = CompiledOp {
+            name: format!("{}_fused_qrelu", conv_op.name),
+            op_type: "Conv2dRequantReluI8".to_string(),
+            inputs: conv_op.inputs.clone(),
+            outputs: vec![fused_output],
+            params: OpParams::Conv2dRequantReluI8Nhwc {
+                kernel_shape,
+                strides,
+                pads,
+                dilations,
+                group,
+                requant_scale,
+                has_relu,
+            },
+        };
+        
+        // Mark requantize (and relu, if matched) for removal; replace conv.
+        ops_to_remove.insert(i);
+        if let Some(ridx) = relu_idx {
+            ops_to_remove.insert(ridx);
+        }
+        fused_ops.push((conv_idx, fused));
+    }
+    
     // Apply fusions: replace ops with fused versions
     for (idx, fused_op) in fused_ops {
         graph.ops[idx] = fused_op;
@@ -235,6 +382,22 @@ pub fn count_fuseable_patterns(graph: &Graph) -> FusionStats {
                 }
             }
         }
+        
+        // Count INT8 Conv-Requant(-Relu) patterns (Task 008).
+        // Pattern anchor is the Requantize op whose output name matches a
+        // preceding Conv's output.
+        if op.op_type == "Requantize" {
+            if let Some(output_name) = op.outputs.first() {
+                let matched = graph.ops.iter().any(|prev| {
+                    prev.op_type == "Conv"
+                        && prev.outputs.first() == Some(output_name)
+                        && matches!(prev.params, OpParams::Conv2d { .. })
+                });
+                if matched {
+                    stats.conv_requant_relu_i8 += 1;
+                }
+            }
+        }
     }
     
     stats
@@ -247,12 +410,14 @@ pub struct FusionStats {
     pub conv_relu: usize,
     /// Number of x * sigmoid(x) patterns (SiLU).
     pub silu: usize,
+    /// Number of INT8 Conv + Requantize (+ optional Relu) patterns (Task 008).
+    pub conv_requant_relu_i8: usize,
 }
 
 impl FusionStats {
     /// Total fuseable patterns.
     pub fn total(&self) -> usize {
-        self.conv_relu + self.silu
+        self.conv_relu + self.silu + self.conv_requant_relu_i8
     }
 }
 
@@ -340,6 +505,161 @@ mod tests {
         
         let stats = count_fuseable_patterns(&graph);
         assert_eq!(stats.silu, 1);
+    }
+    
+    #[test]
+    fn test_conv_requant_relu_i8_fusion() {
+        // Build a graph mirroring the QuantizedGraphCompiler output:
+        //   Conv (OpParams::Conv2d) -> output = "conv_out"
+        //   Requantize             -> input = "conv_out_i32", output = "conv_out"
+        //   Relu                   -> input = "conv_out", output = "relu_out"
+        // After fusion the graph should contain a single op of op_type
+        // "Conv2dRequantReluI8" outputting to "relu_out".
+        let mut graph = Graph {
+            ops: vec![
+                CompiledOp {
+                    name: "conv1".into(),
+                    op_type: "Conv".into(),
+                    inputs: vec!["x".into(), "w".into()],
+                    outputs: vec!["conv_out".into()],
+                    params: OpParams::Conv2d {
+                        kernel_shape: [3, 3],
+                        strides: [1, 1],
+                        pads: [1, 1, 1, 1],
+                        dilations: [1, 1],
+                        group: 1,
+                    },
+                },
+                CompiledOp {
+                    name: "conv1_requant".into(),
+                    op_type: "Requantize".into(),
+                    inputs: vec!["conv_out_i32".into()],
+                    outputs: vec!["conv_out".into()],
+                    params: OpParams::Requantize { scale: 0.0125 },
+                },
+                CompiledOp {
+                    name: "relu1".into(),
+                    op_type: "Relu".into(),
+                    inputs: vec!["conv_out".into()],
+                    outputs: vec!["relu_out".into()],
+                    params: OpParams::None,
+                },
+            ],
+            shapes: HashMap::new(),
+            inputs: vec!["x".into()],
+            outputs: vec!["relu_out".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::I8,
+        };
+        
+        let stats = count_fuseable_patterns(&graph);
+        assert_eq!(stats.conv_requant_relu_i8, 1);
+        
+        apply_fusion_passes(&mut graph);
+        
+        assert_eq!(graph.ops.len(), 1, "should collapse 3 ops to 1");
+        let fused = &graph.ops[0];
+        assert_eq!(fused.op_type, "Conv2dRequantReluI8");
+        assert_eq!(fused.outputs[0], "relu_out");
+        match &fused.params {
+            OpParams::Conv2dRequantReluI8Nhwc {
+                kernel_shape, strides, pads, dilations, group, requant_scale, has_relu,
+            } => {
+                assert_eq!(*kernel_shape, [3, 3]);
+                assert_eq!(*strides, [1, 1]);
+                assert_eq!(*pads, [1, 1, 1, 1]);
+                assert_eq!(*dilations, [1, 1]);
+                assert_eq!(*group, 1);
+                assert!((*requant_scale - 0.0125).abs() < 1e-7);
+                assert!(*has_relu);
+            }
+            _ => panic!("expected Conv2dRequantReluI8Nhwc"),
+        }
+    }
+    
+    #[test]
+    fn test_conv_requant_only_fusion() {
+        // No relu — still fuse Conv+Requant to skip the I32 buffer.
+        let mut graph = Graph {
+            ops: vec![
+                CompiledOp {
+                    name: "conv1".into(),
+                    op_type: "Conv".into(),
+                    inputs: vec!["x".into(), "w".into()],
+                    outputs: vec!["conv_out".into()],
+                    params: OpParams::Conv2d {
+                        kernel_shape: [1, 1],
+                        strides: [1, 1],
+                        pads: [0, 0, 0, 0],
+                        dilations: [1, 1],
+                        group: 1,
+                    },
+                },
+                CompiledOp {
+                    name: "conv1_requant".into(),
+                    op_type: "Requantize".into(),
+                    inputs: vec!["conv_out_i32".into()],
+                    outputs: vec!["conv_out".into()],
+                    params: OpParams::Requantize { scale: 0.02 },
+                },
+            ],
+            shapes: HashMap::new(),
+            inputs: vec!["x".into()],
+            outputs: vec!["conv_out".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::I8,
+        };
+        
+        apply_fusion_passes(&mut graph);
+        
+        assert_eq!(graph.ops.len(), 1);
+        let fused = &graph.ops[0];
+        assert_eq!(fused.op_type, "Conv2dRequantReluI8");
+        assert_eq!(fused.outputs[0], "conv_out");
+        match &fused.params {
+            OpParams::Conv2dRequantReluI8Nhwc { has_relu, .. } => {
+                assert!(!*has_relu, "no relu in graph -> has_relu must be false");
+            }
+            _ => panic!("expected Conv2dRequantReluI8Nhwc"),
+        }
+    }
+    
+    #[test]
+    fn test_conv_requant_skipped_when_group_ne_1() {
+        // Depthwise-style group != 1 should NOT be fused.
+        let mut graph = Graph {
+            ops: vec![
+                CompiledOp {
+                    name: "conv1".into(),
+                    op_type: "Conv".into(),
+                    inputs: vec!["x".into(), "w".into()],
+                    outputs: vec!["conv_out".into()],
+                    params: OpParams::Conv2d {
+                        kernel_shape: [3, 3],
+                        strides: [1, 1],
+                        pads: [1, 1, 1, 1],
+                        dilations: [1, 1],
+                        group: 32, // depthwise
+                    },
+                },
+                CompiledOp {
+                    name: "conv1_requant".into(),
+                    op_type: "Requantize".into(),
+                    inputs: vec!["conv_out_i32".into()],
+                    outputs: vec!["conv_out".into()],
+                    params: OpParams::Requantize { scale: 0.01 },
+                },
+            ],
+            shapes: HashMap::new(),
+            inputs: vec!["x".into()],
+            outputs: vec!["conv_out".into()],
+            initializers: HashMap::new(),
+            dtype: Dtype::I8,
+        };
+        
+        let before = graph.ops.len();
+        apply_fusion_passes(&mut graph);
+        assert_eq!(graph.ops.len(), before, "group!=1 must not fuse");
     }
     
     #[test]

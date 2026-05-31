@@ -332,6 +332,32 @@ pub enum OpParams {
         /// Dequantization scale.
         scale: f32,
     },
+    // =========================================================================
+    // Fused quantized op parameters (Task 008)
+    // =========================================================================
+    /// Fused INT8 Conv2D (NHWC, packed) + Requantize INT32→INT8 + optional ReLU.
+    ///
+    /// Produced by the fusion pass for the common pattern:
+    ///   `Conv (i8 in, i32 acc) → Requantize → Relu`.
+    /// The intermediate INT32 accumulator never materialises in memory; a
+    /// single Vulkan shader (`conv2d_requant_relu_i8_packed`) folds all three
+    /// steps into one dispatch.
+    Conv2dRequantReluI8Nhwc {
+        /// Convolution kernel size [H, W].
+        kernel_shape: [usize; 2],
+        /// Stride [H, W].
+        strides: [usize; 2],
+        /// Padding [top, left, bottom, right].
+        pads: [usize; 4],
+        /// Dilations [H, W] (currently must be [1, 1]).
+        dilations: [usize; 2],
+        /// Convolution groups (currently must be 1 for the fused shader).
+        group: usize,
+        /// Requantization scale: (input_scale * weight_scale) / output_scale.
+        requant_scale: f32,
+        /// Whether to apply ReLU clamp after requantization.
+        has_relu: bool,
+    },
 }
 
 /// Validation report from the validate pass.

@@ -14,7 +14,10 @@ workspace = true
 [features]
 default = []
 cpu = ["dep:dragonwing-cpu"]
-vulkan = ["dep:dragonwing-vulkan"]
+# `vulkan` enables the Vulkan runtime, which falls back to CPU for ops
+# that don't have Vulkan shaders yet (Split, Concat, Slice, Sub, Div,
+# Resize, Transpose). So it pulls in `cpu` transitively.
+vulkan = ["dep:dragonwing-vulkan", "dep:dragonwing-cpu"]
 
 [dependencies]
 dragonwing-core = { path = "../dragonwing-core" }
