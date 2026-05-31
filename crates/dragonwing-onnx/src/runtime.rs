@@ -2407,6 +2407,80 @@ mod cpu_runtime {
             }
         }
     }
+
+    #[cfg(test)]
+    mod per_channel_tests {
+        use super::*;
+
+        #[test]
+        fn quantize_per_channel_applies_per_channel_scale() {
+            // 1x4 (C=4): each channel gets a different scale.
+            // dims=[1,4], axis=1 → outer=1, channels=4, inner=1.
+            let input: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+            let scales = vec![0.5, 1.0, 1.5, 2.0]; // q = round(x / s)
+            let zps = vec![0i8; 4];
+            let mut out = vec![0i8; 4];
+
+            quantize_per_channel_f32_to_i8(&mut out, &input, &[1, 4], 1, &scales, &zps);
+
+            // Expected: [round(1/.5)=2, round(2/1)=2, round(3/1.5)=2, round(4/2)=2]
+            assert_eq!(out, vec![2, 2, 2, 2]);
+        }
+
+        #[test]
+        fn quantize_dequantize_round_trip_per_channel() {
+            // [N=1, C=3, H=2, W=2] tensor, axis=1.
+            let dims = vec![1usize, 3, 2, 2];
+            let numel: usize = dims.iter().product();
+            let input: Vec<f32> = (0..numel).map(|i| (i as f32) * 0.1).collect();
+            let scales = vec![0.05, 0.1, 0.15];
+            let zps = vec![0i8; 3];
+
+            let mut q = vec![0i8; numel];
+            quantize_per_channel_f32_to_i8(&mut q, &input, &dims, 1, &scales, &zps);
+
+            let mut dq = vec![0f32; numel];
+            dequantize_per_channel_i8_to_f32(&mut dq, &q, &dims, 1, &scales, &zps);
+
+            // Round-trip error should be bounded by largest scale / 2.
+            let max_err = scales.iter().cloned().fold(0.0, f32::max) / 2.0 + 1e-5;
+            for (orig, recon) in input.iter().zip(dq.iter()) {
+                let err = (orig - recon).abs();
+                assert!(
+                    err <= max_err,
+                    "round-trip error {err} exceeds bound {max_err} (orig={orig}, recon={recon})"
+                );
+            }
+        }
+
+        #[test]
+        fn quantize_per_channel_axis_zero() {
+            // [C=2, H=3] tensor, axis=0 (per-row scaling).
+            let dims = vec![2usize, 3];
+            let input: Vec<f32> = vec![
+                1.0, 2.0, 3.0,    // channel 0, scale=0.5 → q=2,4,6
+                10.0, 20.0, 30.0, // channel 1, scale=10  → q=1,2,3
+            ];
+            let scales = vec![0.5, 10.0];
+            let zps = vec![0i8; 2];
+            let mut out = vec![0i8; 6];
+
+            quantize_per_channel_f32_to_i8(&mut out, &input, &dims, 0, &scales, &zps);
+            assert_eq!(out, vec![2, 4, 6, 1, 2, 3]);
+        }
+
+        #[test]
+        fn quantize_per_channel_saturates() {
+            // Overflow values clamp to i8 range.
+            let scales = vec![0.01f32];
+            let zps = vec![0i8];
+            let input = vec![10.0f32, -10.0, 0.0];
+            let mut out = vec![0i8; 3];
+
+            quantize_per_channel_f32_to_i8(&mut out, &input, &[1, 3], 0, &scales, &zps);
+            assert_eq!(out, vec![127, -128, 0]);
+        }
+    }
 }
 
 /// Re-export the CPU-optimized runtime when the `cpu` feature is enabled.
