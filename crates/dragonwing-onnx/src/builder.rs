@@ -589,10 +589,22 @@ impl OpBuilder for ConvBuilder {
     fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
         let input_shape = ctx.get_shape(&node.inputs[0])
             .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
-        
-        // Get kernel shape from weight tensor or attribute
-        let weight = ctx.get_initializer(&node.inputs[1])
-            .ok_or_else(|| Error::Validation(format!("weight {} must be constant", node.inputs[1])))?;
+
+        // Resolve weight dims: prefer the initializer (direct path) but
+        // fall back to the registered tensor shape. Task 009 QDQ-format
+        // models put the weight behind a DequantizeLinear, so the weight
+        // input is no longer a direct initializer — its shape was
+        // registered by the DQ builder instead.
+        let weight_dims: Vec<usize> = if let Some(init) = ctx.get_initializer(&node.inputs[1]) {
+            init.dims.iter().map(|&d| d as usize).collect()
+        } else if let Some(shape) = ctx.get_shape(&node.inputs[1]) {
+            shape.dims.clone()
+        } else {
+            return Err(Error::Validation(format!(
+                "Conv weight '{}' must be a constant initializer or have a registered shape",
+                node.inputs[1]
+            )));
+        };
         
         // Weight shape for Conv2D: [C_out, C_in/group, K_h, K_w] (OIHW)
         // Input shape: [N, C_in, H_in, W_in] (NCHW) for ONNX
@@ -601,7 +613,7 @@ impl OpBuilder for ConvBuilder {
         if input_shape.dims.len() != 4 {
             return Err(Error::Validation("Conv input must be 4D (NCHW)".into()));
         }
-        if weight.dims.len() != 4 {
+        if weight_dims.len() != 4 {
             return Err(Error::Validation("Conv weight must be 4D (OIHW)".into()));
         }
 
@@ -610,9 +622,9 @@ impl OpBuilder for ConvBuilder {
         let h_in = input_shape.dims[2];
         let w_in = input_shape.dims[3];
 
-        let c_out = weight.dims[0] as usize;
-        let k_h = weight.dims[2] as usize;
-        let k_w = weight.dims[3] as usize;
+        let c_out = weight_dims[0];
+        let k_h = weight_dims[2];
+        let k_w = weight_dims[3];
 
         let kernel_shape = node.get_attr_ints("kernel_shape");
         let (k_h, k_w) = if kernel_shape.len() == 2 {
@@ -655,9 +667,20 @@ impl OpBuilder for ConvBuilder {
         let output_shape = self.validate(node, ctx)?;
         
         let kernel_shape_attr = node.get_attr_ints("kernel_shape");
-        let weight = ctx.get_initializer(&node.inputs[1]).unwrap();
-        let k_h = if kernel_shape_attr.len() == 2 { kernel_shape_attr[0] as usize } else { weight.dims[2] as usize };
-        let k_w = if kernel_shape_attr.len() == 2 { kernel_shape_attr[1] as usize } else { weight.dims[3] as usize };
+        // Same dual lookup as validate(): initializer first, then registered
+        // shape (for QDQ-wrapped weights).
+        let weight_dims: Vec<usize> = if let Some(init) = ctx.get_initializer(&node.inputs[1]) {
+            init.dims.iter().map(|&d| d as usize).collect()
+        } else if let Some(shape) = ctx.get_shape(&node.inputs[1]) {
+            shape.dims.clone()
+        } else {
+            return Err(Error::Validation(format!(
+                "Conv weight '{}' not found",
+                node.inputs[1]
+            )));
+        };
+        let k_h = if kernel_shape_attr.len() == 2 { kernel_shape_attr[0] as usize } else { weight_dims[2] };
+        let k_w = if kernel_shape_attr.len() == 2 { kernel_shape_attr[1] as usize } else { weight_dims[3] };
 
         let strides = node.get_attr_ints("strides");
         let (stride_h, stride_w) = if strides.len() == 2 {
@@ -2129,7 +2152,15 @@ impl OpBuilder for SliceBuilder {
     }
 
     fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
-        let input_shape = ctx.get_shape(&node.inputs[0]).unwrap().clone();
+        let input_shape = ctx
+            .get_shape(&node.inputs[0])
+            .ok_or_else(|| {
+                Error::Validation(format!(
+                    "Slice '{}': input '{}' has no shape registered",
+                    node.name, node.inputs[0]
+                ))
+            })?
+            .clone();
         let output_shape = self.validate(node, ctx)?;
         
         let starts: Vec<isize> = get_i64_constant(ctx, &node.inputs[1])?.iter().map(|&s| s as isize).collect();

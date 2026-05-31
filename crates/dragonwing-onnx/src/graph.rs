@@ -593,6 +593,10 @@ fn onnx_dtype_to_dragonwing(onnx_dtype: DataType, default: Dtype) -> Dtype {
     match onnx_dtype {
         DataType::Float => Dtype::F32,
         DataType::Float16 => Dtype::F16,
+        // Task 009 — INT8 initializers (pre-quantized weights from
+        // ONNX Runtime QDQ export) keep their I8 dtype so the QDQ-fold
+        // pass can recognise them without trying to re-quantize.
+        DataType::Int8 | DataType::Uint8 => Dtype::I8,
         // For weights stored as other types, use the graph's default dtype
         _ => default,
     }

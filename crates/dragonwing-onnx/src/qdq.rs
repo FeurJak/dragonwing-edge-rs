@@ -124,7 +124,19 @@ pub fn fold_qdq_patterns(graph: &mut Graph) -> Result<QdqFoldStats> {
     // the input/output of an INT8 conv).
     let mut shape_updates: Vec<(String, TensorShape)> = Vec::new();
 
+    // Optional debug tracing — set DRAGONWING_QDQ_DEBUG=1 to see which
+    // convs the fold pass rejected and why. Useful when an INT8 model
+    // loads structurally but produces conv_folded=0.
+    let debug = std::env::var("DRAGONWING_QDQ_DEBUG").is_ok();
+
     for conv_idx in &conv_indices {
+        if debug {
+            let c = &graph.ops[*conv_idx];
+            let reason = trace_conv_fold_failure(graph, *conv_idx, &producers, &consumer_counts);
+            if let Some(r) = reason {
+                eprintln!("[qdq-debug] skip Conv '{}' ({} inputs): {}", c.name, c.inputs.len(), r);
+            }
+        }
         match try_fold_conv(graph, *conv_idx, &producers, &consumer_counts) {
             Some(folded) => {
                 stats.conv_folded += 1;
@@ -249,6 +261,92 @@ struct ConvFold {
     shape_updates: Vec<(String, TensorShape)>,
 }
 
+/// Diagnostic shadow of `try_fold_conv` — returns `Some(reason)` when the
+/// fold would be skipped, or `None` when it would succeed. Only used by
+/// the `DRAGONWING_QDQ_DEBUG=1` debug path.
+fn trace_conv_fold_failure(
+    graph: &Graph,
+    conv_idx: usize,
+    producers: &HashMap<String, usize>,
+    consumer_counts: &HashMap<String, usize>,
+) -> Option<String> {
+    let conv_op = &graph.ops[conv_idx];
+    if conv_op.inputs.len() > 2 && !conv_op.inputs[2].is_empty() {
+        return Some(format!(
+            "conv has bias '{}' (v1 fold supports biasless convs only)",
+            conv_op.inputs[2]
+        ));
+    }
+    let act_in = conv_op.inputs.first()?;
+    let act_dq_idx = match producers.get(act_in) {
+        Some(i) => *i,
+        None => return Some(format!("no producer for activation input '{act_in}'")),
+    };
+    let act_dq = &graph.ops[act_dq_idx];
+    if act_dq.op_type != "DequantizeLinear" {
+        return Some(format!(
+            "activation producer is '{}', not DequantizeLinear",
+            act_dq.op_type
+        ));
+    }
+    let act_cnt = consumer_counts.get(act_in).copied().unwrap_or(0);
+    if act_cnt != 1 {
+        return Some(format!("activation DQ output has {act_cnt} consumers (need 1)"));
+    }
+    if qdq_scalar_scale(act_dq).is_none() {
+        return Some(format!(
+            "activation DQ params not per-tensor: {:?}",
+            act_dq.params
+        ));
+    }
+    let w_in = conv_op.inputs.get(1)?;
+    let w_dq_idx = match producers.get(w_in) {
+        Some(i) => *i,
+        None => return Some(format!("no producer for weight input '{w_in}'")),
+    };
+    let w_dq = &graph.ops[w_dq_idx];
+    if w_dq.op_type != "DequantizeLinear" {
+        return Some(format!(
+            "weight producer is '{}', not DequantizeLinear",
+            w_dq.op_type
+        ));
+    }
+    let w_cnt = consumer_counts.get(w_in).copied().unwrap_or(0);
+    if w_cnt != 1 {
+        return Some(format!("weight DQ output has {w_cnt} consumers (need 1)"));
+    }
+    if qdq_weight_scale(w_dq, graph, w_in).is_none() {
+        return Some(format!("weight DQ params not recognised: {:?}", w_dq.params));
+    }
+    let out = conv_op.outputs.first()?;
+    let out_cnt = consumer_counts.get(out).copied().unwrap_or(0);
+    if out_cnt != 1 {
+        return Some(format!("conv output has {out_cnt} consumers (need 1)"));
+    }
+    let q_idx = graph
+        .ops
+        .iter()
+        .position(|op| op.op_type == "QuantizeLinear" && op.inputs.first() == Some(out));
+    if q_idx.is_none() {
+        return Some("no QuantizeLinear consumes the Conv output".into());
+    }
+    if let Some(q_idx) = q_idx {
+        let q = &graph.ops[q_idx];
+        if qdq_scalar_scale(q).is_none() {
+            return Some(format!("output Q params not per-tensor: {:?}", q.params));
+        }
+    }
+    // Weight shape / data checks.
+    let w_i8 = w_dq.inputs.first()?.clone();
+    if graph.shapes.get(&w_i8).is_none() {
+        return Some(format!("weight initializer '{w_i8}' has no registered shape"));
+    }
+    if graph.initializers.get(&w_i8).is_none() {
+        return Some(format!("weight '{w_i8}' is not an initializer"));
+    }
+    None
+}
+
 fn try_fold_conv(
     graph: &Graph,
     conv_idx: usize,
@@ -256,6 +354,15 @@ fn try_fold_conv(
     consumer_counts: &HashMap<String, usize>,
 ) -> Option<ConvFold> {
     let conv_op = &graph.ops[conv_idx];
+
+    // v1 limitation: only fold biasless convs. The fused INT8 shader
+    // (Conv2dRequantReluI8Nhwc) does not accept bias and a bias DQ
+    // would leave the Conv with mixed dtype inputs. The existing fusion
+    // pass also refuses bias, so folding here would just produce a
+    // dead-end op.
+    if conv_op.inputs.len() > 2 && !conv_op.inputs[2].is_empty() {
+        return None;
+    }
 
     // 1. Activation DQ — producer of conv_op.inputs[0].
     let act_input_name = conv_op.inputs.first()?;
